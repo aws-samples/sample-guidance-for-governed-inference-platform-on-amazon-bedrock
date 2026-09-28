@@ -1,0 +1,1 @@
+../assets/docs/CONSOLE.md

@@ -1,0 +1,1 @@
+../assets/docs/NETWORK_ISOLATION.md

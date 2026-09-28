@@ -1,0 +1,1 @@
+../assets/docs/HOW_IT_WORKS.md

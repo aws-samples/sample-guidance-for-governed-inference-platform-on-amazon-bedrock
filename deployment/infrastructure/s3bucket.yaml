@@ -1,0 +1,175 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'S3 Bucket for CloudFormation artifacts (Lambda code packages)'
+
+Parameters:
+  OrganizationId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^o-[a-z0-9]{10,32}$'
+    Description: >-
+      Optional AWS Organizations ID (o-xxxxxxxxxx). When set, a bucket policy
+      grants read-only access (s3:GetObject) to every principal in the
+      organization via aws:PrincipalOrgID, so CloudFormation in StackSet
+      target accounts can fetch packaged Lambda assets from this bucket.
+      Leave empty to keep the bucket single-account (default: off). Same
+      opt-in pattern as skills-registry.yaml.
+
+Conditions:
+  IsOrg: !Not [!Equals [!Ref OrganizationId, '']]
+
+Resources:
+  # Access-log bucket (same pattern as codebuild-windows.yaml LoggingBucket)
+  CfnArtifactsLoggingBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: 'Dedicated server-access-log destination. AWS Security Hub control S3.9: "The target logging bucket does not need to have server access logging enabled, and you should suppress findings for this bucket." Logging a log bucket to itself is documented by AWS as an infinite loop and not recommended (S3 User Guide, enable-server-access-logging).'
+      guard:
+        SuppressedRules:
+          # Log destination bucket: self-logging would recurse. Object Lock is
+          # irreversible and lifecycle expiry manages retention. No ACL is
+          # configured (private default) and public access is fully blocked.
+          - S3_BUCKET_LOGGING_ENABLED
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 90
+      Tags:
+        - Key: Name
+          Value: gip-cfn-artifacts-logs
+        - Key: Purpose
+          Value: AccessLogs
+
+  CfnArtifactsLoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CfnArtifactsLoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt CfnArtifactsLoggingBucket.Arn
+              - !Sub '${CfnArtifactsLoggingBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+          # S3 server access log delivery (CfnArtifactsBucket LoggingConfiguration)
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CfnArtifactsLoggingBucket.Arn}/s3-access-logs/*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+              ArnLike:
+                aws:SourceArn: !GetAtt CfnArtifactsBucket.Arn
+
+  # S3 Bucket for CloudFormation artifacts (Lambda code packages)
+  CfnArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Object Lock is irreversible and wrong for a mutable packaging
+          # bucket with noncurrent-version expiry; no ACL is configured
+          # (private default) and public access is fully blocked.
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref CfnArtifactsLoggingBucket
+        LogFilePrefix: s3-access-logs/cfn-artifacts/
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: gip-cfn-artifacts
+        - Key: Purpose
+          Value: CloudFormation Lambda packaging
+
+  # Organization-wide read for StackSet targets (only when OrganizationId is
+  # set). CloudFormation in each target account fetches packaged Lambda code
+  # with s3:GetObject — no ListBucket or write access is granted.
+  # Policy resource is unconditional so the TLS-only statement always
+  # applies; the org-wide read grant stays gated on IsOrg via !If.
+  CfnArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Not public: the wildcard principal in OrgWideArtifactRead is
+          # constrained to this organization by the aws:PrincipalOrgID
+          # condition (the rule does not evaluate conditions), and the
+          # DenyInsecureTransport statement uses '*' as deny statements must.
+          - S3_BUCKET_POLICY_NO_WILDCARD_PRINCIPAL
+    Properties:
+      Bucket: !Ref CfnArtifactsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - !If
+            - IsOrg
+            - Sid: OrgWideArtifactRead
+              Effect: Allow
+              Principal: '*'
+              Action: 's3:GetObject'
+              Resource: !Sub '${CfnArtifactsBucket.Arn}/*'
+              Condition:
+                StringEquals:
+                  'aws:PrincipalOrgID': !Ref OrganizationId
+            - !Ref 'AWS::NoValue'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt CfnArtifactsBucket.Arn
+              - !Sub '${CfnArtifactsBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+Outputs:
+  CfnArtifactsBucket:
+    Description: S3 bucket for CloudFormation artifacts
+    Value: !Ref CfnArtifactsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-CfnArtifactsBucket"

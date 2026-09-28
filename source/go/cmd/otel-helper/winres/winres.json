@@ -1,0 +1,49 @@
+{
+  "RT_MANIFEST": {
+    "#1": {
+      "0409": {
+        "identity": {
+          "name": "com.amazon.gip.otel-helper",
+          "version": "2.0.0.0"
+        },
+        "description": "OpenTelemetry Helper for Governed Inference Platform on Amazon Bedrock",
+        "minimum-os": "vista",
+        "execution-level": "asInvoker",
+        "ui-access": false,
+        "auto-elevate": false,
+        "dpi-awareness": "unaware",
+        "disable-theming": false,
+        "disable-window-filtering": false,
+        "high-resolution-scrolling-aware": false,
+        "ultra-high-resolution-scrolling-aware": false,
+        "long-path-aware": true,
+        "printer-driver-isolation": false,
+        "gdi-scaling": false,
+        "segment-heap": false,
+        "use-common-controls-v6": false
+      }
+    }
+  },
+  "RT_VERSION": {
+    "#1": {
+      "0000": {
+        "fixed": {
+          "file_version": "2.0.0.0",
+          "product_version": "2.0.0.0"
+        },
+        "info": {
+          "0409": {
+            "CompanyName": "Amazon.com, Inc.",
+            "FileDescription": "OpenTelemetry Helper for Governed Inference Platform on Amazon Bedrock",
+            "FileVersion": "2.0.0.0",
+            "InternalName": "otel-helper",
+            "LegalCopyright": "Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.",
+            "OriginalFilename": "otel-helper.exe",
+            "ProductName": "Governed Inference Platform",
+            "ProductVersion": "2.0.0.0"
+          }
+        }
+      }
+    }
+  }
+}

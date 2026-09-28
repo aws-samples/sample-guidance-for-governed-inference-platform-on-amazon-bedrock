@@ -1,0 +1,8 @@
+{
+  "name": "deployment",
+  "version": "1.0.0",
+  "description": "Deployment orchestration and compliance automation with progressive rollout strategies",
+  "author": {
+    "name": "AWS Solutions Library"
+  }
+}

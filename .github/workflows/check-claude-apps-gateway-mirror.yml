@@ -1,0 +1,42 @@
+name: Check Claude Apps Gateway pin
+
+on:
+  pull_request:
+    branches: ["main", "beta"]
+    paths:
+      - 'vendor/aws-samples/anthropic-on-aws/**'
+      - 'scripts/fetch-claude-apps-gateway.sh'
+      - 'scripts/sync-claude-apps-gateway.sh'
+      - '.github/workflows/check-claude-apps-gateway-mirror.yml'
+      - '.github/workflows/sync-claude-apps-gateway.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch pinned commit and verify materialized Git tree ids
+        run: scripts/fetch-claude-apps-gateway.sh
+
+      - name: Re-verify paths, types, modes, symlink targets, and bytes offline
+        run: scripts/fetch-claude-apps-gateway.sh --verify
+
+      - name: Confirm the committed pin regenerates from upstream unchanged
+        run: |
+          commit=$(
+            jq -r .commit vendor/aws-samples/anthropic-on-aws/UPSTREAM.json
+          )
+          scripts/sync-claude-apps-gateway.sh --check --ref "$commit"
+
+      - name: Remove materialized upstream source
+        if: always()
+        run: scripts/fetch-claude-apps-gateway.sh --clean

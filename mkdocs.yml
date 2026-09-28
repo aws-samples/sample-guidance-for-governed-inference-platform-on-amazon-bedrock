@@ -1,0 +1,159 @@
+site_name: Governed AI Inference Platform on Amazon Bedrock
+site_description: Enterprise guidance for a governed Bedrock inference endpoint — SSO, budgets, attribution, and model governance for Claude Code, Claude Desktop (Cowork), and any AWS-SDK harness
+site_url: https://aws-samples.github.io/sample-guidance-for-governed-inference-platform-on-amazon-bedrock/
+repo_url: https://github.com/aws-samples/sample-guidance-for-governed-inference-platform-on-amazon-bedrock
+repo_name: aws-samples/sample-guidance-for-governed-inference-platform-on-amazon-bedrock
+edit_uri: edit/main/
+
+theme:
+  name: material
+  custom_dir: docs/overrides
+  palette:
+    - scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  font: false
+  icon:
+    logo: custom/aws
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+    - toc.follow
+    - toc.integrate
+
+extra_css:
+  - stylesheets/custom.css?v=11
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - tables
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+  - git-revision-date-localized:
+      enable_creation_date: false
+      enable_git_follow: false
+      strict: false
+      type: timeago
+
+hooks:
+  - docs/mkdocs_hooks.py
+
+validation:
+  links:
+    anchors: warn
+    unrecognized_links: warn
+
+nav:
+  - Home: index.md
+  - Getting Started: QUICK_START.md
+  - How the Controls Work: HOW_IT_WORKS.md
+  - Authentication:
+    - IdP Requirements Contract: providers/README.md
+    - Okta: providers/okta-setup.md
+    - Microsoft Entra ID: providers/microsoft-entra-id-setup.md
+    - Auth0: providers/auth0-setup.md
+    - AWS Cognito: providers/cognito-user-pool-setup.md
+    - Google OIDC: providers/google-oidc-setup.md
+    - Generic OIDC: providers/generic-oidc-setup.md
+    - IAM Identity Center: providers/iam-identity-center-setup.md
+  - Deployment:
+    - Choosing a Deployment Path: DEPLOYMENT_PATHS.md
+    - Deployment Console (GUI): CONSOLE.md
+    - Launch Stacks (quick-create): LAUNCH_STACKS.md
+    - Deployment Guide: DEPLOYMENT.md
+    - Component Map: COMPONENTS.md
+    - Agent-Assisted Deployment: AGENT_DEPLOY.md
+    - Architecture: ARCHITECTURE.md
+    - Claude Apps Gateway: APPS_GATEWAY.md
+    - Multi-Account Deployment: MULTI_ACCOUNT.md
+    - Network Isolation (PrivateLink): NETWORK_ISOLATION.md
+    - Windows Build System: WINDOWS_BUILD_SYSTEM.md
+  - Distribution:
+    - Platform Comparison: distribution/comparison.md
+    - Deployment Guide: distribution/deployment-guide.md
+  - Operations:
+    - Runbooks: RUNBOOKS.md
+    - Open Items and Known Gaps: OPEN_ITEMS.md
+    - Live Validation: LIVE_VALIDATION.md
+    - Failure Posture: FAILURE_POSTURE.md
+    - Monitoring: MONITORING.md
+    - Analytics: ANALYTICS.md
+    - Model Lifecycle: MODEL_LIFECYCLE.md
+    - Quota Monitoring: QUOTA_MONITORING.md
+    - Bedrock Guardrails: GUARDRAILS.md
+    - SIEM Export: SIEM_EXPORT.md
+    - Resource Inventory: RESOURCE_INVENTORY.md
+    - Cost Estimates: COST_ESTIMATES.md
+    - Cost Attribution: COST_ATTRIBUTION.md
+  - Usage:
+    - CLI Reference: CLI_REFERENCE.md
+    - Local Testing: LOCAL_TESTING.md
+    - Claude Desktop (CoWork): COWORK_3P.md
+    - Other Harnesses (OpenCode, Codex, Pi, Aider): HARNESSES.md
+    - Skills Registry: SKILLS_REGISTRY.md
+    - Memory: MEMORY.md
+    - Web Search: WEB_SEARCH.md
+    - MCP Gateway: MCP_GATEWAY.md
+    - Bootstrap Server: BOOTSTRAP_SERVER.md
+    - Troubleshooting: TROUBLESHOOTING.md
+    - Plugins: PLUGINS.md
+  - Decisions:
+    - ADR Index: adr/README.md
+    - 0001 Base on upstream beta: adr/0001-base-on-upstream-beta.md
+    - 0002 Cost limits as schema fields: adr/0002-cost-limits-first-class-schema-fields.md
+    - 0003 Apps gateway is additive: adr/0003-apps-gateway-additional-architecture.md
+    - 0004 Gateway config via CFN env: adr/0004-gateway-config-cfn-rendered-env.md
+    - 0005 Metering from invocation logs: adr/0005-server-side-metering-from-invocation-logs.md
+    - 0006 Default-on IAM model scoping: adr/0006-default-on-iam-model-scoping.md
+    - 0007 Multi-harness credential_process: adr/0007-multi-harness-credential-process.md
+    - 0008 Non-interactive init: adr/0008-non-interactive-init-answers-file.md
+    - 0009 Enforcement at issuance: adr/0009-enforcement-at-credential-issuance.md
+    - 0011 Platform-first positioning: adr/0011-platform-first-positioning.md
+    - 0012 Wave 3 operating decisions: adr/0012-wave3-operating-decisions.md
+    - 0013 Legacy Python credential provider: adr/0013-legacy-python-credential-provider.md
+    - 0014 Gateway Cedar entitlements: adr/0014-gateway-cedar-entitlements.md
+    - 0015 Session-name binding: adr/0015-session-name-binding.md
+    - 0016 AgentCore Memory stack: adr/0016-agentcore-memory-stack.md
+    - 0017 Skills registry on Agent Registry: adr/0017-skills-registry-on-agent-registry.md
+    - 0018 Model lifecycle overlay vs codegen: adr/0018-model-lifecycle-overlay-vs-codegen.md
+    - 0019 Multi-account + network isolation doc-first: adr/0019-multi-account-network-isolation-doc-first.md
+    - 0020 Guardrails account-level enforcement: adr/0020-bedrock-guardrails-account-enforcement.md
+    - 0021 Application inference profiles (additive): adr/0021-application-inference-profiles-additive.md
+    - 0022 Mantle metering deferred + tripwire: adr/0022-mantle-metering-deferred-tripwire.md
+    - 0023 Deterministic skill eval runner: adr/0023-deterministic-skill-eval-runner.md
+    - 0024 Harness MCP wiring: adr/0024-harness-mcp-wiring.md
+    - 0025 Verified telemetry OIDC bearer: adr/0025-verified-telemetry-oidc-bearer.md
+    - 0026 Account-local inference cell state: adr/0026-account-local-inference-cell-state.md

@@ -1,0 +1,1221 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'OpenTelemetry Collector on ECS Fargate for Claude Code metrics - supports both VPC creation and existing VPC'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Networking"
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - ALBScheme
+      - Label:
+          default: "HTTPS and custom domain"
+        Parameters:
+          - CustomDomainName
+          - HostedZoneId
+          - CertificateArn
+          - AllowInsecureHttpIngress
+      - Label:
+          default: "Client authentication (OIDC)"
+        Parameters:
+          - OidcIssuerUrl
+          - OidcJwksEndpoint
+          - OidcClientId
+          - CoWorkServiceToken
+      - Label:
+          default: "Collector settings"
+        Parameters:
+          - CollectorImage
+          - EnableAnalytics
+      - Label:
+          default: "Operations"
+        Parameters:
+          - AlarmTopicArn
+    ParameterLabels:
+      VpcId:
+        default: "VPC ID"
+      SubnetIds:
+        default: "Subnet IDs (at least two)"
+      ALBScheme:
+        default: "Load balancer scheme"
+      CustomDomainName:
+        default: "Custom domain name (enables HTTPS)"
+      HostedZoneId:
+        default: "Route 53 hosted zone ID"
+      CertificateArn:
+        default: "Existing ACM certificate ARN"
+      AllowInsecureHttpIngress:
+        default: "Allow plaintext HTTP ingress (local development only)"
+      OidcIssuerUrl:
+        default: "OIDC issuer URL"
+      OidcJwksEndpoint:
+        default: "OIDC JWKS endpoint URL"
+      OidcClientId:
+        default: "OIDC client ID (token audience)"
+      CoWorkServiceToken:
+        default: "Claude Desktop (CoWork) service token (optional)"
+      CollectorImage:
+        default: "OpenTelemetry Collector container image"
+      EnableAnalytics:
+        default: "Enable analytics dual-export"
+      AlarmTopicArn:
+        default: "Alarm SNS topic ARN (optional)"
+
+Parameters:
+  VpcId:
+    Type: String
+    Description: VPC ID where the collector will be deployed
+
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: Subnet IDs for the collector (at least 2 for ALB)
+
+  CollectorImage:
+    Type: String
+    Default: otel/opentelemetry-collector-contrib@sha256:125bdbeb7590cc1952c5b3430ecf14063568980c2c93d5b38676cc0446ed8108
+    Description: >-
+      OpenTelemetry Collector Contrib 0.156.0, pinned by digest. Contrib is required
+      (transform processor) and the OpenTelemetry project does not publish it to ECR
+      Public. Organisations restricted to ECR Public or a private registry mirror the
+      image into their own ECR and set this parameter.
+
+  CustomDomainName:
+    Type: String
+    Default: ''
+    Description: Optional custom domain name for HTTPS (e.g., telemetry.company.com) - if provided, HTTPS will be enabled automatically
+
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: Route53 hosted zone ID for custom domain - required for automatic ACM certificate creation and DNS record. Not needed when using CertificateArn with external DNS (e.g., Cloudflare).
+
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: ARN of an existing ACM certificate for HTTPS. Use this when DNS is managed externally (e.g., Cloudflare) and you cannot use Route53 for automatic certificate validation. When provided, HostedZoneId is not required.
+
+  AllowInsecureHttpIngress:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      DANGEROUS: Allow plaintext collector ingress for internal local-development
+      compatibility only. Never enable for production or internet-facing deployments.
+      Bearer tokens and telemetry are unencrypted when this is true.
+
+  OidcIssuerUrl:
+    Type: String
+    Default: ''
+    Description: OIDC issuer URL for ALB JWT validation
+
+  OidcJwksEndpoint:
+    Type: String
+    Default: ''
+    Description: JWKS endpoint URL for ALB JWT signature validation
+
+  OidcClientId:
+    Type: String
+    Default: ''
+    Description: OIDC client ID for ALB JWT audience (aud) claim validation
+
+  EnableAnalytics:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable dual-export (OTLP + EMF) for analytics pipeline. When false, only OTLP export is used.
+
+  CoWorkServiceToken:
+    Type: String
+    Default: ''
+    NoEcho: true
+    AllowedPattern: '^$|^[A-Za-z0-9._~+/=-]{32,128}$'
+    ConstraintDescription: Must be empty or a 32-128 character token without ALB wildcard characters.
+    Description: >-
+      Optional static token for aggregate CoWork (Claude Desktop) telemetry on
+      internal load balancers only.
+      When set, a listener rule allows requests with header
+      X-Cowork-Token matching this value to bypass JWT validation.
+      CoWork cannot perform OIDC auth (no browser/helper), so this
+      provides an alternative auth path for its OTLP events.
+
+  ALBScheme:
+    Type: String
+    Default: 'internal'
+    AllowedValues:
+      - 'internet-facing'
+      - 'internal'
+    Description: >-
+      Load balancer scheme. Use 'internal' for private network deployments
+      where users connect via VPN, Direct Connect, or internal office networks.
+      Default: internal. Use internet-facing only with HTTPS and an explicit
+      authentication path configured by the deploy tooling.
+
+  AlarmTopicArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional SNS topic ARN (same region) notified when the collector has no
+      healthy ALB targets. Empty = the collector-down alarm is still created
+      and visible in the CloudWatch console, but sends no notifications.
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref CustomDomainName, '']]
+  InsecureHttpIngressEnabled: !Equals [!Ref AllowInsecureHttpIngress, 'true']
+  EnableInsecureHttpIngress: !And
+    - !Condition InsecureHttpIngressEnabled
+    - !Not [!Condition HasCustomDomain]
+  HasHostedZone: !Not [!Equals [!Ref HostedZoneId, '']]
+  HasExternalCertificate: !Not [!Equals [!Ref CertificateArn, '']]
+  CreateAcmCertificate: !And
+    - !Condition HasCustomDomain
+    - !Condition HasHostedZone
+    - !Not [!Condition HasExternalCertificate]
+  CreateDnsRecord: !And
+    - !Condition HasCustomDomain
+    - !Condition HasHostedZone
+  EnableHttps: !And
+    - !Condition HasCustomDomain
+    - !Or
+      - !Condition HasHostedZone
+      - !Condition HasExternalCertificate
+  HasJwtAuth: !Not [!Equals [!Ref OidcIssuerUrl, '']]
+  HasOidcJwksEndpoint: !Not [!Equals [!Ref OidcJwksEndpoint, '']]
+  HasOidcClientId: !Not [!Equals [!Ref OidcClientId, '']]
+  HasVerifiedJwtIngress: !And
+    - !Condition EnableHttps
+    - !Condition HasJwtAuth
+    - !Condition HasOidcJwksEndpoint
+    - !Condition HasOidcClientId
+  HasCoWorkToken: !Not [!Equals [!Ref CoWorkServiceToken, '']]
+  HasCoWorkAuthBypass: !And
+    - !Condition EnableHttps
+    - !Condition HasCustomDomain
+    - !Condition HasJwtAuth
+    - !Condition HasCoWorkToken
+    - !Condition IsInternalALB
+  AnalyticsEnabled: !Equals [!Ref EnableAnalytics, 'true']
+  IsInternalALB: !Equals [!Ref ALBScheme, 'internal']
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, '']]
+
+Rules:
+  CollectorIngressRequiresTlsOrExplicitInsecureOptIn:
+    Assertions:
+      - Assert: !Or
+          - !Not [!Equals [!Ref CustomDomainName, '']]
+          - !Equals [!Ref AllowInsecureHttpIngress, 'true']
+        AssertDescription: Collector ingress requires HTTPS by default. For internal local development only, explicitly set AllowInsecureHttpIngress=true.
+
+  InsecureHttpIngressIsInternalLocalDevelopmentOnly:
+    RuleCondition: !Equals [!Ref AllowInsecureHttpIngress, 'true']
+    Assertions:
+      - Assert: !Equals [!Ref ALBScheme, 'internal']
+        AssertDescription: AllowInsecureHttpIngress=true is forbidden for internet-facing load balancers.
+      - Assert: !Equals [!Ref CustomDomainName, '']
+        AssertDescription: Do not combine the insecure local-development mode with a TLS custom domain.
+
+  CustomDomainRequiresHttpsConfiguration:
+    RuleCondition: !Not [!Equals [!Ref CustomDomainName, '']]
+    Assertions:
+      - Assert: !Or
+          - !Not [!Equals [!Ref HostedZoneId, '']]
+          - !Not [!Equals [!Ref CertificateArn, '']]
+        AssertDescription: CustomDomainName requires HostedZoneId or CertificateArn so the collector service has an HTTPS path.
+
+  InternetFacingRequiresHttpsAndJwt:
+    RuleCondition: !Equals [!Ref ALBScheme, 'internet-facing']
+    Assertions:
+      - Assert: !Not [!Equals [!Ref CustomDomainName, '']]
+        AssertDescription: Internet-facing monitoring requires CustomDomainName.
+      - Assert: !Or
+          - !Not [!Equals [!Ref HostedZoneId, '']]
+          - !Not [!Equals [!Ref CertificateArn, '']]
+        AssertDescription: Internet-facing monitoring requires HostedZoneId or CertificateArn so HTTPS is enabled.
+      - Assert: !Not [!Equals [!Ref OidcIssuerUrl, '']]
+        AssertDescription: Internet-facing monitoring requires OidcIssuerUrl for ALB JWT validation.
+      - Assert: !Not [!Equals [!Ref OidcJwksEndpoint, '']]
+        AssertDescription: Internet-facing monitoring requires OidcJwksEndpoint for ALB JWT validation.
+      - Assert: !Not [!Equals [!Ref OidcClientId, '']]
+        AssertDescription: Internet-facing monitoring requires OidcClientId for ALB JWT validation.
+      - Assert: !Equals [!Ref CoWorkServiceToken, '']
+        AssertDescription: CoWorkServiceToken is forbidden for internet-facing load balancers; use verified OIDC for attributed CoWork telemetry.
+
+Resources:
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: gip-otel-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+
+  # CloudWatch Log Groups
+  CollectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      guard:
+        SuppressedRules:
+          - CLOUDWATCH_LOG_GROUP_ENCRYPTED
+    Properties:
+      LogGroupName: /ecs/otel-collector
+      RetentionInDays: 7
+
+  MetricsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: AnalyticsEnabled
+    Metadata:
+      guard:
+        SuppressedRules:
+          - CLOUDWATCH_LOG_GROUP_ENCRYPTED
+    Properties:
+      LogGroupName: /aws/gip/metrics
+      RetentionInDays: 30
+      Tags:
+        - Key: Purpose
+          Value: Claude Code Usage Metrics
+        - Key: Stack
+          Value: !Ref AWS::StackName
+
+  # CoWork telemetry log group. The collector's awscloudwatchlogs/cowork exporter
+  # writes here, and the cowork-dashboard stack attaches MetricFilters to it. A
+  # MetricFilter requires its target log group to already exist at deploy time,
+  # so this group must be a managed resource (not left to runtime auto-creation by
+  # the exporter) — otherwise the cowork-dashboard deploy fails on a fresh stack
+  # with "The specified log group does not exist". RetentionInDays matches the
+  # exporter's log_retention (30).
+  CoWorkEventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      guard:
+        SuppressedRules:
+          - CLOUDWATCH_LOG_GROUP_ENCRYPTED
+    Properties:
+      LogGroupName: /aws/gip/cowork-events
+      RetentionInDays: 30
+      Tags:
+        - Key: Purpose
+          Value: Claude CoWork Telemetry
+        - Key: Stack
+          Value: !Ref AWS::StackName
+
+  # Security Groups
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for OTEL Collector ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !If [IsInternalALB, '10.0.0.0/8', '0.0.0.0/0']
+          Description: !If [IsInternalALB, 'HTTPS from private networks (10.x.x.x)', 'HTTPS access from anywhere']
+        - !If
+          - IsInternalALB
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: '172.16.0.0/12'
+            Description: 'HTTPS from private networks (172.16.x.x)'
+          - !Ref AWS::NoValue
+        - !If
+          - IsInternalALB
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: '192.168.0.0/16'
+            Description: 'HTTPS from private networks (192.168.x.x)'
+          - !Ref AWS::NoValue
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !If [IsInternalALB, '10.0.0.0/8', '0.0.0.0/0']
+          Description: !If [IsInternalALB, 'HTTP from private networks (10.x.x.x)', 'HTTP access (redirects to HTTPS)']
+        - !If
+          - IsInternalALB
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: '172.16.0.0/12'
+            Description: 'HTTP from private networks (172.16.x.x)'
+          - !Ref AWS::NoValue
+        - !If
+          - IsInternalALB
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: '192.168.0.0/16'
+            Description: 'HTTP from private networks (192.168.x.x)'
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: otel-collector-alb-sg
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for OTEL Collector tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 4317
+          ToPort: 4317
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: OTLP gRPC from ALB
+        - IpProtocol: tcp
+          FromPort: 4318
+          ToPort: 4318
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: OTLP HTTP from ALB
+        - IpProtocol: tcp
+          FromPort: 4319
+          ToPort: 4319
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Collector health check from ALB
+      Tags:
+        - Key: Name
+          Value: otel-collector-task-sg
+
+  # ACM Certificate (created automatically when using Route53 for DNS validation)
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: CreateAcmCertificate
+    Properties:
+      DomainName: !Ref CustomDomainName
+      DomainValidationOptions:
+        - DomainName: !Ref CustomDomainName
+          HostedZoneId: !Ref HostedZoneId
+      ValidationMethod: DNS
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-certificate'
+
+  # Route53 Record for custom domain
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateDnsRecord
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref CustomDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: false
+
+  # Application Load Balancer
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      IpAddressType: ipv4
+      Scheme: !Ref ALBScheme
+      LoadBalancerAttributes:
+        # Raise the idle timeout above the AWS default of 60s. Claude Code
+        # reuses a pooled keep-alive connection for OTLP metric exports, which
+        # only happen after activity (e.g. a model response). At 60s the ALB
+        # reaps the connection during idle gaps between turns, so the next
+        # export reuses a dead socket and logs a benign but noisy "socket hang
+        # up". 300s covers typical in-session pauses. (Reduces, but cannot fully
+        # eliminate — arbitrarily long idle gaps still reap the connection; the
+        # root cause is client-side connection reuse.)
+        - Key: idle_timeout.timeout_seconds
+          Value: '300'
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: otel-collector-alb
+        - Key: Purpose
+          Value: HTTPS-enabled OTEL collector for Claude Code
+
+  # Aggregate-only ingress for shared-token and unauthenticated traffic.
+  HTTPTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      # Name is derived from the ALB's unique hex ID (last segment of its ARN).
+      # When the LoadBalancer is replaced its unique ID changes, so this name
+      # changes too — CloudFormation replaces the target group alongside the LB.
+      # Without this coupling, CF tries to attach the old TG to the new LB while
+      # the old LB still owns it, producing:
+      #   "target group cannot be associated with more than one load balancer"
+      # Using the ALB ID keeps the name within the 32-char limit: "tg-" (3) +
+      # 16-char hex ID = 19 chars max. (issue #86 used !Sub '${AWS::StackName}-tg'
+      # which exceeded the limit for long stack names; this approach avoids that.)
+      Name: !Sub
+        - 'tg-${AlbId}'
+        - AlbId: !Select [3, !Split ['/', !Ref LoadBalancer]]
+      Port: 4318
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckEnabled: true
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200,404'
+
+  # Separate trust boundary for ALB-validated JWT ingress.
+  VerifiedTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub
+        - 'tg-v-${AlbId}'
+        - AlbId: !Select [3, !Split ['/', !Ref LoadBalancer]]
+      Port: 4319
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckEnabled: true
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200,404'
+
+  # Listeners
+  # When HTTPS is enabled, :80 must NOT forward to the collector — a plaintext
+  # forward would bypass the JWT validation configured on :443, letting anyone
+  # on the internet inject OTLP telemetry with arbitrary x-user-email /
+  # x-user-id attribution headers. Instead :80 issues an HTTP 301 redirect to
+  # :443 (matching the ALB security-group description). The plain-HTTP
+  # explicit internal local-development mode keeps the forward action. A
+  # CloudFormation rule rejects that branch unless AllowInsecureHttpIngress=true.
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Metadata:
+      guard:
+        SuppressedRules:
+          - ELBV2_LISTENER_SSL_POLICY_RULE
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: !If
+        - EnableHttps
+        - - Type: redirect
+            RedirectConfig:
+              Protocol: HTTPS
+              Port: '443'
+              StatusCode: HTTP_301
+        - - Type: forward
+            TargetGroupArn: !Ref HTTPTargetGroup
+
+  HTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: EnableHttps
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !If
+            - HasExternalCertificate
+            - !Ref CertificateArn
+            - !Ref Certificate
+      DefaultActions: !If
+        - HasVerifiedJwtIngress
+        - - Type: jwt-validation
+            Order: 1
+            JwtValidationConfig:
+              Issuer: !Ref OidcIssuerUrl
+              JwksEndpoint: !Ref OidcJwksEndpoint
+              AdditionalClaims:
+                - Name: aud
+                  Format: single-string
+                  Values:
+                    - !Ref OidcClientId
+          - Type: forward
+            Order: 2
+            TargetGroupArn: !Ref VerifiedTargetGroup
+        - - Type: forward
+            TargetGroupArn: !Ref HTTPTargetGroup
+      SslPolicy: ELBSecurityPolicy-TLS-1-2-2017-01
+
+  # Internal-only CoWork auth bypass: allows aggregate CoWork traffic to reach
+  # the collector by presenting a static service token in a custom header.
+  # Internet-facing deployments must use verified OIDC instead.
+  CoWorkListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: HasCoWorkAuthBypass
+    Properties:
+      ListenerArn: !Ref HTTPSListener
+      Priority: 1
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Cowork-Token
+            Values:
+              - !Ref CoWorkServiceToken
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref HTTPTargetGroup
+
+  # Non-OTLP path keeps the aggregate target associated before ECS registers it.
+  AggregateTargetRegistrationRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: EnableHttps
+    Properties:
+      ListenerArn: !Ref HTTPSListener
+      Priority: 50000
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /__gip-internal/aggregate-target-registration
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref HTTPTargetGroup
+
+  # IAM Roles
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      Policies:
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt CollectorLogGroup.Arn
+                  - !Sub '${CollectorLogGroup.Arn}:*'
+        - PolicyName: SSMParameterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/gip-otel-config'
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - !If
+                - AnalyticsEnabled
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                    - logs:CreateLogGroup
+                    - logs:PutRetentionPolicy
+                  Resource:
+                    - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/gip/metrics'
+                    - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/gip/metrics:*'
+                    - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/gip/cowork-events'
+                    - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/gip/cowork-events:*'
+                - !Ref 'AWS::NoValue'
+        - PolicyName: SSMParameterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/gip-otel-config'
+
+  # SSM Parameter for Configuration — single resource with conditional value
+  # to avoid delete+create race during stack updates between analytics modes.
+  OTelConfig:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: gip-otel-config
+      Type: String
+      Tier: Advanced
+      Description: !If
+        - AnalyticsEnabled
+        - "OpenTelemetry configuration - dual export (OTLP + EMF)"
+        - "OpenTelemetry configuration - OTLP export only"
+      Value: !If
+        - AnalyticsEnabled
+        - !Sub |
+            extensions:
+              health_check:
+                endpoint: 0.0.0.0:13133
+                path: /
+              sigv4auth:
+                service: monitoring
+                region: ${AWS::Region}
+
+            receivers:
+              otlp/aggregate:
+                protocols:
+                  grpc: {endpoint: 0.0.0.0:4317, include_metadata: true}
+                  http: {endpoint: 0.0.0.0:4318, include_metadata: true}
+              otlp/verified:
+                protocols:
+                  http: {endpoint: 0.0.0.0:4319, include_metadata: true}
+
+            processors:
+              batch/metrics:
+                timeout: 60s
+              transform/verified:
+                error_mode: propagate
+                metric_statements:
+                  - context: resource
+                    statements:
+                      - &scrub_resource 'delete_matching_keys(resource.attributes, ".*")'
+                      - 'set(resource.cache["p"], Split(otelcol.client.metadata["authorization"][0], "."))'
+                      - 'set(resource.cache["c"], ParseJSON(Decode(resource.cache["p"][1], "base64-raw-url")))'
+                      - 'set(resource.cache["h"], SHA256(Coalesce([resource.cache["c"]["sub"], resource.cache["c"]["user_id"]])))'
+                      - 'set(resource.attributes["user.id"], Concat([Substring(resource.cache["h"], 0, 8), Substring(resource.cache["h"], 8, 4), Substring(resource.cache["h"], 12, 4), Substring(resource.cache["h"], 16, 4), Substring(resource.cache["h"], 20, 12)], "-"))'
+                      - 'set(resource.attributes["user.email"], Coalesce([resource.cache["c"]["email"], resource.cache["c"]["preferred_username"], resource.cache["c"]["mail"], "unknown@example.com"]))'
+                      - 'set(resource.attributes["telemetry.identity.scope"], "verified_oidc")'
+                  - context: scope
+                    statements:
+                      - &scrub_scope 'delete_matching_keys(scope.attributes, ".*")'
+                      - &set_scope_name 'set(scope.name, "gip")'
+                      - &clear_scope_version 'set(scope.version, "")'
+                  - context: datapoint
+                    statements:
+                      - &flatten_datapoint 'flatten(datapoint.attributes)'
+                      - &scrub_datapoint 'keep_keys(datapoint.attributes, ["model", "type", "tool_name", "language", "decision", "terminal.type"])'
+                      - 'set(datapoint.attributes["user.id"], resource.attributes["user.id"])'
+                      - 'set(datapoint.attributes["user.email"], resource.attributes["user.email"])'
+                log_statements:
+                  - context: resource
+                    statements:
+                      - *scrub_resource
+                      - 'set(resource.cache["p"], Split(otelcol.client.metadata["authorization"][0], "."))'
+                      - 'set(resource.cache["c"], ParseJSON(Decode(resource.cache["p"][1], "base64-raw-url")))'
+                      - 'set(resource.cache["h"], SHA256(Coalesce([resource.cache["c"]["sub"], resource.cache["c"]["user_id"]])))'
+                      - 'set(resource.attributes["user.id"], Concat([Substring(resource.cache["h"], 0, 8), Substring(resource.cache["h"], 8, 4), Substring(resource.cache["h"], 12, 4), Substring(resource.cache["h"], 16, 4), Substring(resource.cache["h"], 20, 12)], "-"))'
+                      - 'set(resource.attributes["user.email"], Coalesce([resource.cache["c"]["email"], resource.cache["c"]["preferred_username"], resource.cache["c"]["mail"], "unknown@example.com"]))'
+                      - 'set(resource.attributes["telemetry.identity.scope"], "verified_oidc")'
+                  - context: scope
+                    statements:
+                      - *scrub_scope
+                      - *set_scope_name
+                      - *clear_scope_version
+                  - context: log
+                    statements:
+                      - &flatten_log_attrs 'flatten(log.attributes)'
+                      - &scrub_log_attrs 'keep_keys(log.attributes, ["model", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "cost_usd", "type", "tool_name", "language", "decision"])'
+                      - &scrub_log_body 'keep_keys(log.body, ["name", "attributes"]) where IsMap(log.body)'
+                      - &drop_nonmap_body_attrs 'delete_key(log.body, "attributes") where IsMap(log.body) and not IsMap(log.body["attributes"])'
+                      - &flatten_body_attrs 'flatten(log.body["attributes"]) where IsMap(log.body) and IsMap(log.body["attributes"])'
+                      - &scrub_body_attrs 'keep_keys(log.body["attributes"], ["model", "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "total_cost_usd"]) where IsMap(log.body) and IsMap(log.body["attributes"])'
+                      - &scrub_body_name 'set(log.body["name"], "aggregate_event") where IsMap(log.body) and log.body["name"] != "lam_session_turn_completed"'
+                      - &scrub_string_body 'set(log.body, "aggregate_event") where not IsMap(log.body) and (not IsString(log.body) or log.body != "claude_code.api_request")'
+                      - 'set(log.attributes["user.id"], resource.attributes["user.id"])'
+                      - 'set(log.attributes["user.email"], resource.attributes["user.email"])'
+                      - 'set(log.attributes["user_id"], resource.attributes["user.id"])'
+                      - 'set(log.attributes["user_email"], resource.attributes["user.email"])'
+              transform/aggregate:
+                error_mode: propagate
+                metric_statements:
+                  - context: resource
+                    statements:
+                      - *scrub_resource
+                      - 'set(resource.attributes["telemetry.identity.scope"], "aggregate")'
+                  - context: scope
+                    statements:
+                      - *scrub_scope
+                      - *set_scope_name
+                      - *clear_scope_version
+                  - context: datapoint
+                    statements:
+                      - *flatten_datapoint
+                      - *scrub_datapoint
+                log_statements:
+                  - context: resource
+                    statements:
+                      - *scrub_resource
+                      - 'set(resource.attributes["telemetry.identity.scope"], "aggregate")'
+                  - context: scope
+                    statements:
+                      - *scrub_scope
+                      - *set_scope_name
+                      - *clear_scope_version
+                  - context: log
+                    statements:
+                      - *flatten_log_attrs
+                      - *scrub_log_attrs
+                      - *scrub_log_body
+                      - *drop_nonmap_body_attrs
+                      - *flatten_body_attrs
+                      - *scrub_body_attrs
+                      - *scrub_body_name
+                      - *scrub_string_body
+              resource:
+                attributes:
+                  - {key: service.name, value: claude-code, action: upsert}
+                  - {key: OTelLib, value: gip, action: upsert}
+                  - {key: aws.account_id, value: "${AWS::AccountId}", action: insert}
+                  - {key: deployment.environment, value: production, action: insert}
+
+            exporters:
+              otlphttp:
+                tls: {insecure: false}
+                endpoint: https://monitoring.${AWS::Region}.amazonaws.com
+                auth: {authenticator: sigv4auth}
+
+              awsemf:
+                namespace: GIP
+                log_group_name: /aws/gip/metrics
+                region: ${AWS::Region}
+                output_destination: cloudwatch
+                log_retention: 7
+                resource_to_telemetry_conversion:
+                  enabled: true
+                metric_declarations:
+                  - {dimensions: [[OTelLib]], metric_name_selectors: [.*]}
+                  - {dimensions: [[model, OTelLib]], metric_name_selectors: [.*]}
+                  - {dimensions: [[user.email, OTelLib]], metric_name_selectors: [claude_code.token.usage, claude_code.cost.usage]}
+                  - {dimensions: [[type, OTelLib]], metric_name_selectors: [claude_code.token.usage, claude_code.lines_of_code.count]}
+                  - {dimensions: [[tool_name, OTelLib]], metric_name_selectors: [claude_code.code_edit_tool.*]}
+                  - {dimensions: [[language, OTelLib]], metric_name_selectors: [claude_code.code_edit_tool.*]}
+                  - {dimensions: [[decision, OTelLib]], metric_name_selectors: [claude_code.code_edit_tool.decision]}
+
+              awscloudwatchlogs/cowork:
+                log_group_name: /aws/gip/cowork-events
+                log_stream_name: cowork-telemetry
+                region: ${AWS::Region}
+                log_retention: 30
+
+            service:
+              extensions: [health_check, sigv4auth]
+              telemetry:
+                logs:
+                  level: info
+                  development: false
+                  encoding: json
+                  output_paths: [stdout]
+              pipelines:
+                metrics/verified:
+                  receivers: [otlp/verified]
+                  processors: [transform/verified, resource, batch/metrics]
+                  exporters: [otlphttp, awsemf]
+                metrics/aggregate:
+                  receivers: [otlp/aggregate]
+                  processors: [transform/aggregate, resource, batch/metrics]
+                  exporters: [otlphttp, awsemf]
+                logs/verified:
+                  receivers: [otlp/verified]
+                  processors: [transform/verified, resource]
+                  exporters: [awscloudwatchlogs/cowork]
+                logs/aggregate:
+                  receivers: [otlp/aggregate]
+                  processors: [transform/aggregate, resource]
+                  exporters: [awscloudwatchlogs/cowork]
+        - !Sub |
+            extensions:
+              health_check:
+                endpoint: 0.0.0.0:13133
+                path: /
+              sigv4auth:
+                service: monitoring
+                region: ${AWS::Region}
+
+            receivers:
+              otlp/aggregate:
+                protocols:
+                  grpc: {endpoint: 0.0.0.0:4317, include_metadata: true}
+                  http: {endpoint: 0.0.0.0:4318, include_metadata: true}
+              otlp/verified:
+                protocols:
+                  http: {endpoint: 0.0.0.0:4319, include_metadata: true}
+
+            processors:
+              batch/metrics:
+                timeout: 60s
+              transform/verified:
+                error_mode: propagate
+                metric_statements:
+                  - context: resource
+                    statements:
+                      - &scrub_resource 'delete_matching_keys(resource.attributes, ".*")'
+                      - 'set(resource.cache["p"], Split(otelcol.client.metadata["authorization"][0], "."))'
+                      - 'set(resource.cache["c"], ParseJSON(Decode(resource.cache["p"][1], "base64-raw-url")))'
+                      - 'set(resource.cache["h"], SHA256(Coalesce([resource.cache["c"]["sub"], resource.cache["c"]["user_id"]])))'
+                      - 'set(resource.attributes["user.id"], Concat([Substring(resource.cache["h"], 0, 8), Substring(resource.cache["h"], 8, 4), Substring(resource.cache["h"], 12, 4), Substring(resource.cache["h"], 16, 4), Substring(resource.cache["h"], 20, 12)], "-"))'
+                      - 'set(resource.attributes["user.email"], Coalesce([resource.cache["c"]["email"], resource.cache["c"]["preferred_username"], resource.cache["c"]["mail"], "unknown@example.com"]))'
+                      - 'set(resource.attributes["telemetry.identity.scope"], "verified_oidc")'
+                  - context: scope
+                    statements:
+                      - &scrub_scope 'delete_matching_keys(scope.attributes, ".*")'
+                      - &set_scope_name 'set(scope.name, "gip")'
+                      - &clear_scope_version 'set(scope.version, "")'
+                  - context: datapoint
+                    statements:
+                      - &flatten_datapoint 'flatten(datapoint.attributes)'
+                      - &scrub_datapoint 'keep_keys(datapoint.attributes, ["model", "type", "tool_name", "language", "decision", "terminal.type"])'
+                      - 'set(datapoint.attributes["user.id"], resource.attributes["user.id"])'
+                      - 'set(datapoint.attributes["user.email"], resource.attributes["user.email"])'
+                log_statements:
+                  - context: resource
+                    statements:
+                      - *scrub_resource
+                      - 'set(resource.cache["p"], Split(otelcol.client.metadata["authorization"][0], "."))'
+                      - 'set(resource.cache["c"], ParseJSON(Decode(resource.cache["p"][1], "base64-raw-url")))'
+                      - 'set(resource.cache["h"], SHA256(Coalesce([resource.cache["c"]["sub"], resource.cache["c"]["user_id"]])))'
+                      - 'set(resource.attributes["user.id"], Concat([Substring(resource.cache["h"], 0, 8), Substring(resource.cache["h"], 8, 4), Substring(resource.cache["h"], 12, 4), Substring(resource.cache["h"], 16, 4), Substring(resource.cache["h"], 20, 12)], "-"))'
+                      - 'set(resource.attributes["user.email"], Coalesce([resource.cache["c"]["email"], resource.cache["c"]["preferred_username"], resource.cache["c"]["mail"], "unknown@example.com"]))'
+                      - 'set(resource.attributes["telemetry.identity.scope"], "verified_oidc")'
+                  - context: scope
+                    statements:
+                      - *scrub_scope
+                      - *set_scope_name
+                      - *clear_scope_version
+                  - context: log
+                    statements:
+                      - &flatten_log_attrs 'flatten(log.attributes)'
+                      - &scrub_log_attrs 'keep_keys(log.attributes, ["model", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "cost_usd", "type", "tool_name", "language", "decision"])'
+                      - &scrub_log_body 'keep_keys(log.body, ["name", "attributes"]) where IsMap(log.body)'
+                      - &drop_nonmap_body_attrs 'delete_key(log.body, "attributes") where IsMap(log.body) and not IsMap(log.body["attributes"])'
+                      - &flatten_body_attrs 'flatten(log.body["attributes"]) where IsMap(log.body) and IsMap(log.body["attributes"])'
+                      - &scrub_body_attrs 'keep_keys(log.body["attributes"], ["model", "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "total_cost_usd"]) where IsMap(log.body) and IsMap(log.body["attributes"])'
+                      - &scrub_body_name 'set(log.body["name"], "aggregate_event") where IsMap(log.body) and log.body["name"] != "lam_session_turn_completed"'
+                      - &scrub_string_body 'set(log.body, "aggregate_event") where not IsMap(log.body) and (not IsString(log.body) or log.body != "claude_code.api_request")'
+                      - 'set(log.attributes["user.id"], resource.attributes["user.id"])'
+                      - 'set(log.attributes["user.email"], resource.attributes["user.email"])'
+                      - 'set(log.attributes["user_id"], resource.attributes["user.id"])'
+                      - 'set(log.attributes["user_email"], resource.attributes["user.email"])'
+              transform/aggregate:
+                error_mode: propagate
+                metric_statements:
+                  - context: resource
+                    statements:
+                      - *scrub_resource
+                      - 'set(resource.attributes["telemetry.identity.scope"], "aggregate")'
+                  - context: scope
+                    statements:
+                      - *scrub_scope
+                      - *set_scope_name
+                      - *clear_scope_version
+                  - context: datapoint
+                    statements:
+                      - *flatten_datapoint
+                      - *scrub_datapoint
+                log_statements:
+                  - context: resource
+                    statements:
+                      - *scrub_resource
+                      - 'set(resource.attributes["telemetry.identity.scope"], "aggregate")'
+                  - context: scope
+                    statements:
+                      - *scrub_scope
+                      - *set_scope_name
+                      - *clear_scope_version
+                  - context: log
+                    statements:
+                      - *flatten_log_attrs
+                      - *scrub_log_attrs
+                      - *scrub_log_body
+                      - *drop_nonmap_body_attrs
+                      - *flatten_body_attrs
+                      - *scrub_body_attrs
+                      - *scrub_body_name
+                      - *scrub_string_body
+              resource:
+                attributes:
+                  - {key: service.name, value: claude-code, action: upsert}
+                  - {key: OTelLib, value: gip, action: upsert}
+                  - {key: aws.account_id, value: "${AWS::AccountId}", action: insert}
+                  - {key: deployment.environment, value: production, action: insert}
+
+            exporters:
+              otlphttp:
+                tls:
+                  insecure: false
+                endpoint: "https://monitoring.${AWS::Region}.amazonaws.com"
+                auth:
+                  authenticator: sigv4auth
+
+              awscloudwatchlogs/cowork:
+                log_group_name: /aws/gip/cowork-events
+                log_stream_name: cowork-telemetry
+                region: ${AWS::Region}
+                log_retention: 30
+
+            service:
+              extensions: [health_check, sigv4auth]
+              telemetry:
+                logs:
+                  level: info
+                  development: false
+                  encoding: json
+                  output_paths: [stdout]
+              pipelines:
+                metrics/verified:
+                  receivers: [otlp/verified]
+                  processors: [transform/verified, resource, batch/metrics]
+                  exporters: [otlphttp]
+                metrics/aggregate:
+                  receivers: [otlp/aggregate]
+                  processors: [transform/aggregate, resource, batch/metrics]
+                  exporters: [otlphttp]
+                logs/verified:
+                  receivers: [otlp/verified]
+                  processors: [transform/verified, resource]
+                  exporters: [awscloudwatchlogs/cowork]
+                logs/aggregate:
+                  receivers: [otlp/aggregate]
+                  processors: [transform/aggregate, resource]
+                  exporters: [awscloudwatchlogs/cowork]
+
+  # ECS Task Definition
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: otel-collector
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: aws-otel-collector
+          Image: !Ref CollectorImage
+          Command:
+            - --config=env:AOT_CONFIG_CONTENT
+          Essential: true
+          Memory: 512
+          Secrets:
+            - Name: AOT_CONFIG_CONTENT
+              ValueFrom: !Ref OTelConfig
+          PortMappings:
+            - ContainerPort: 4317
+              Protocol: tcp
+            - ContainerPort: 4318
+              Protocol: tcp
+            - ContainerPort: 4319
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CollectorLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # ECS Service — split into two conditional resources so that each path has
+  # the correct DependsOn without referencing a conditionally-absent resource.
+  # CloudFormation validates DependsOn unconditionally at parse time, so a
+  # single resource cannot safely list a conditional resource as a dependency.
+
+  # Explicit internal local-development HTTP path: wait only for HTTPListener.
+  ECSServiceHTTP:
+    Type: AWS::ECS::Service
+    Condition: EnableInsecureHttpIngress
+    DependsOn:
+      - HTTPListener
+    Properties:
+
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+          Subnets: !Ref SubnetIds
+      LoadBalancers:
+        - ContainerName: aws-otel-collector
+          ContainerPort: 4318
+          TargetGroupArn: !Ref HTTPTargetGroup
+      HealthCheckGracePeriodSeconds: 60
+
+  # HTTPS path (custom domain): wait for both listeners so the target group
+  # association via HTTPSListener is ready before the service registers tasks
+  ECSServiceHTTPS:
+    Type: AWS::ECS::Service
+    Condition: EnableHttps
+    DependsOn:
+      - HTTPListener
+      - HTTPSListener
+      - AggregateTargetRegistrationRule
+    Properties:
+
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+          Subnets: !Ref SubnetIds
+      LoadBalancers:
+        - ContainerName: aws-otel-collector
+          ContainerPort: 4318
+          TargetGroupArn: !Ref HTTPTargetGroup
+        - !If
+          - HasVerifiedJwtIngress
+          - ContainerName: aws-otel-collector
+            ContainerPort: 4319
+            TargetGroupArn: !Ref VerifiedTargetGroup
+          - !Ref AWS::NoValue
+      HealthCheckGracePeriodSeconds: 60
+
+  # Fail-visible collector-down alarm: telemetry paths may degrade but must
+  # degrade visibly. HealthyHostCount is emitted by the ALB per target group,
+  # so it keeps reporting (at 0) while the ECS tasks are down — unlike
+  # collector-emitted metrics, which simply stop. Created for both the HTTP
+  # and HTTPS service variants (the target group exists in both paths).
+  CollectorUnhealthyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-collector-unhealthy'
+      AlarmDescription: >-
+        OTEL collector has no healthy ALB targets — client telemetry is being
+        dropped (no backfill) and client-reported quota usage is going stale.
+        See assets/docs/RUNBOOKS.md section 2.
+      Namespace: AWS/ApplicationELB
+      MetricName: HealthyHostCount
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt LoadBalancer.LoadBalancerFullName
+        - Name: TargetGroup
+          Value: !GetAtt HTTPTargetGroup.TargetGroupFullName
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  # Auto Scaling - Commented out due to service-linked role requirements
+  # Uncomment if you want auto-scaling and have the necessary service-linked role
+  # Note: ECSService was split into ECSServiceHTTP (explicit insecure local-dev
+  # opt-in) and ECSServiceHTTPS (TLS). If re-enabling auto-scaling, use the
+  # variant that matches your deployment.
+  #
+  # ServiceScalingTarget:
+  #   Type: AWS::ApplicationAutoScaling::ScalableTarget
+  #   DependsOn: ECSServiceHTTPS  # or ECSServiceHTTP if not using a custom domain
+  #   Properties:
+  #     MaxCapacity: 3
+  #     MinCapacity: 1
+  #     ResourceId: !Sub 'service/${ECSCluster}/otel-collector-service'
+  #     ScalableDimension: ecs:service:DesiredCount
+  #     ServiceNamespace: ecs
+  #
+  # ServiceScalingPolicy:
+  #   Type: AWS::ApplicationAutoScaling::ScalingPolicy
+  #   Properties:
+  #     PolicyName: otel-collector-cpu-scaling
+  #     PolicyType: TargetTrackingScaling
+  #     ScalingTargetId: !Ref ServiceScalingTarget
+  #     TargetTrackingScalingPolicyConfiguration:
+  #       PredefinedMetricSpecification:
+  #         PredefinedMetricType: ECSServiceAverageCPUUtilization
+  #       ScaleInCooldown: 60
+  #       ScaleOutCooldown: 60
+  #       TargetValue: 70
+
+Outputs:
+  VpcId:
+    Description: VPC ID used
+    Value: !Ref VpcId
+
+  SubnetIds:
+    Description: Subnet IDs used by the collector
+    Value: !Join [',', !Ref SubnetIds]
+
+  CollectorEndpoint:
+    Description: Endpoint for OTLP metrics
+    Value: !If
+      - EnableHttps
+      - !Sub 'https://${CustomDomainName}'
+      - !Sub 'http://${LoadBalancer.DNSName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-endpoint'
+
+  VerifiedCollectorEndpoint:
+    Description: TLS endpoint whose default listener validates OIDC JWTs before forwarding OTLP
+    Condition: HasVerifiedJwtIngress
+    Value: !Sub 'https://${CustomDomainName}'
+
+  ALBEndpoint:
+    Description: ALB DNS name
+    Value: !GetAtt LoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-alb-dns'
+
+  ConfigParameterName:
+    Description: SSM Parameter containing collector configuration
+    Value: !Ref OTelConfig
+
+  LogGroupName:
+    Description: CloudWatch Log Group for metrics (only when analytics enabled)
+    Condition: AnalyticsEnabled
+    Value: /aws/gip/metrics
+
+  Note:
+    Description: Important deployment information
+    Value: !If
+      - EnableHttps
+      - !Sub |
+        OTEL collector is available at: https://${CustomDomainName}
+        Certificate validation is automatic via Route53.
+        Claude Code settings will use this HTTPS endpoint.
+      - !Sub |
+        OTEL collector is available at: http://${LoadBalancer.DNSName}
+        DANGER: Explicit local-development-only HTTP mode is enabled.
+        Telemetry and bearer tokens are not encrypted in transit. Never use this
+        mode for production or internet-facing deployments. Migrate by providing
+        CustomDomainName and HostedZoneId or CertificateArn, then set
+        AllowInsecureHttpIngress=false.

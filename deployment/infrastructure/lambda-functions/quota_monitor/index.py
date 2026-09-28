@@ -1,0 +1,820 @@
+# ABOUTME: Lambda function that monitors user token quotas and sends SNS alerts
+# ABOUTME: Queries CloudWatch PromQL API for usage data, writes to DynamoDB, checks thresholds
+
+import json
+import os
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from decimal import Decimal
+
+import boto3
+from boto3.dynamodb.conditions import Attr, Key
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
+
+# Initialize clients
+dynamodb = boto3.resource("dynamodb")
+sns_client = boto3.client("sns")
+cloudwatch_client = boto3.client("cloudwatch")
+
+# Configuration from environment
+QUOTA_TABLE = os.environ.get("QUOTA_TABLE", "UserQuotaMetrics")
+POLICIES_TABLE = os.environ.get("POLICIES_TABLE")
+SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN")
+ENABLE_FINEGRAINED_QUOTAS = os.environ.get("ENABLE_FINEGRAINED_QUOTAS", "false").lower() == "true"
+QUOTA_MODE = os.environ.get("QUOTA_MODE", "token")
+METRICS_REGION = os.environ.get("METRICS_REGION", os.environ.get("AWS_REGION", "us-east-1"))
+
+# Default limits
+MONTHLY_TOKEN_LIMIT = int(os.environ.get("MONTHLY_TOKEN_LIMIT", "300000000"))
+WARNING_THRESHOLD_80 = int(os.environ.get("WARNING_THRESHOLD_80", "240000000"))
+WARNING_THRESHOLD_90 = int(os.environ.get("WARNING_THRESHOLD_90", "270000000"))
+# Cost-based ($ USD) limits — 0 means disabled (matches quota_check/index.py)
+MONTHLY_COST_LIMIT_USD = float(os.environ.get("MONTHLY_COST_LIMIT_USD", "0"))
+DAILY_COST_LIMIT_USD = float(os.environ.get("DAILY_COST_LIMIT_USD", "0"))
+# Server-side metering reconciliation (quota-metering stack): alert when
+# |client - server| / server exceeds this percentage AND the server-side
+# month-to-date total exceeds the noise floor (avoids alerting on tiny users).
+DRIFT_ALERT_PERCENT = float(os.environ.get("DRIFT_ALERT_PERCENT", "25"))
+DRIFT_MIN_SERVER_TOKENS = int(os.environ.get("DRIFT_MIN_SERVER_TOKENS", "1000000"))
+
+# DynamoDB tables
+quota_table = dynamodb.Table(QUOTA_TABLE)
+policies_table = dynamodb.Table(POLICIES_TABLE) if POLICIES_TABLE else None
+
+# PromQL endpoint
+PROMQL_ENDPOINT = f"https://monitoring.{METRICS_REGION}.amazonaws.com/api/v1/query"
+
+
+def _promql_query(query, time_param=None):
+    """Execute a PromQL instant query against CloudWatch Prometheus-compatible API with SigV4."""
+    data = urllib.parse.urlencode({"query": query})
+    if time_param:
+        data += f"&time={time_param}"
+    url = PROMQL_ENDPOINT
+
+    request = AWSRequest(
+        method="POST",
+        url=url,
+        data=data.encode("utf-8"),
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+    )
+    credentials = boto3.Session().get_credentials().get_frozen_credentials()
+    SigV4Auth(credentials, "monitoring", METRICS_REGION).add_auth(request)
+
+    req = urllib.request.Request(url, data=data.encode("utf-8"), headers=dict(request.headers), method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:  # nosec B310 — https AMP endpoint from stack config, SigV4-signed
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:500]
+        print(f"[DEBUG] HTTP {e.code}: {body}")
+        raise
+
+    if result.get("status") != "success":
+        raise RuntimeError(f"PromQL query failed: {result}")
+    return result["data"].get("result", [])
+
+
+AGGREGATION_WINDOW = 900  # 15 minutes in seconds (matches EventBridge schedule)
+
+# Map the metric's `type` dimension values to pricing.py rate keys.
+# The CloudWatch `type` dimension is camelCase (input/output/cacheRead/
+# cacheCreation); the rate tables in shared/pricing.py are snake_case
+# (input/output/cache_read/cache_write). cacheCreation (cache-write) is usually
+# the majority of tokens, so a missing mapping silently drops most of the cost.
+TOKEN_TYPE_TO_RATE_KEY = {
+    "input": "input",
+    "output": "output",
+    "cacheRead": "cache_read",
+    "cacheCreation": "cache_write",
+}
+
+
+def fetch_usage_from_promql():
+    """Query PromQL for per-user token usage in the last aggregation window only.
+
+    Aggregation MUST use sum_over_time(), NOT increase(). Claude Code exports
+    ``claude_code.token.usage`` as an OpenTelemetry Counter with DELTA temporality
+    by default (OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta): each
+    datapoint is the tokens emitted since the last export, so the series steps up
+    AND down (a sawtooth). increase() assumes CUMULATIVE temporality (a monotonic
+    running total) and reads every down-step as a counter reset — it returns empty
+    or wildly understated results, which froze DynamoDB and surfaced as
+    "Daily Tokens: 0" in `gip quota usage`. sum_over_time() sums the per-interval
+    deltas in the window = tokens used in the last 15 minutes, matching how the
+    Athena/CloudWatch consumers compute usage.
+
+    Coupling: this is correct only while the metric is exported with delta
+    temporality. If a deployment sets the temporality preference to `cumulative`,
+    increase() would become the correct function instead.
+    """
+    window = AGGREGATION_WINDOW
+
+    # Delta tokens per user in the last window
+    results = _promql_query(f'sum by ("user.email")(sum_over_time({{"claude_code.token.usage"}}[{window}s]))')
+
+    # Delta token type AND model breakdown per user (for cost calculation)
+    type_model_results = _promql_query(
+        f'sum by ("user.email", type, model)(sum_over_time({{"claude_code.token.usage"}}[{window}s]))'
+    )
+
+    # Delta token type breakdown per user (without model, for backward compat)
+    type_results = _promql_query(
+        f'sum by ("user.email", type)(sum_over_time({{"claude_code.token.usage"}}[{window}s]))'
+    )
+
+    users = {}
+    for r in results:
+        email = r["metric"].get("user.email", "")
+        val = float(r["value"][1])
+        if email and val > 0:
+            users[email] = {"total_tokens": val}
+
+    for r in type_results:
+        email = r["metric"].get("user.email", "")
+        token_type = r["metric"].get("type", "")
+        val = float(r["value"][1])
+        if email and val > 0:
+            u = users.setdefault(email, {})
+            if token_type == "input":  # nosec B105 — metric label value, not a password
+                u["input_tokens"] = val
+            elif token_type == "output":  # nosec B105 — metric label value, not a password
+                u["output_tokens"] = val
+            elif token_type in ("cache_read", "cacheRead"):
+                u["cache_tokens"] = val
+
+    # Calculate per-user cost from model-aware token breakdown
+    try:
+        import sys
+
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        from shared.pricing import get_rates, resolve_model_family
+
+        rates = get_rates()
+        for r in type_model_results:
+            email = r["metric"].get("user.email", "")
+            token_type = r["metric"].get("type", "")
+            model = r["metric"].get("model", "")
+            val = float(r["value"][1])
+            if email and val > 0 and token_type and model:
+                u = users.setdefault(email, {})
+                family = resolve_model_family(model)
+                family_rates = rates.get(family, rates.get("sonnet", {}))
+                rate = family_rates.get(TOKEN_TYPE_TO_RATE_KEY.get(token_type, token_type), 0)
+                cost_delta = (val / 1_000_000) * rate
+                u["cost_usd"] = u.get("cost_usd", 0) + cost_delta
+    except Exception as e:
+        # Cost calculation is optional — don't fail the whole run
+        print(f"Cost calculation skipped (non-fatal): {e}")
+
+    print(f"Fetched delta usage for {len(users)} users from PromQL ({window}s window)")
+
+    # Also fetch CoWork 3P token usage (separate namespace, MetricFilter-derived).
+    # CoWork events are logged to /aws/gip/cowork-events and MetricFilters extract
+    # per-user metrics into the ClaudeCoWork namespace with user_email dimension.
+    # This ensures CoWork token consumption counts toward the same quota as Claude Code.
+    try:
+        # CoWork metrics are MetricFilter-derived per-event token counts (delta,
+        # not cumulative) — use sum_over_time() for the same reason as above.
+        cowork_input = _promql_query(
+            f'sum by ("user_email", "model")(sum_over_time({{"ClaudeCoWork","token.usage.input"}}[{window}s]))'
+        )
+        cowork_output = _promql_query(
+            f'sum by ("user_email", "model")(sum_over_time({{"ClaudeCoWork","token.usage.output"}}[{window}s]))'
+        )
+        cowork_count = 0
+        for r in cowork_input + cowork_output:
+            email = r["metric"].get("user_email", "")
+            model = r["metric"].get("model", "")
+            val = float(r["value"][1])
+            if email and val > 0:
+                u = users.setdefault(email, {"total_tokens": 0})
+                u["total_tokens"] = u.get("total_tokens", 0) + val
+                # Calculate cost if model dimension is available
+                if model:
+                    try:
+                        family = resolve_model_family(model)
+                        family_rates = rates.get(family, rates.get("sonnet", {}))
+                        # Determine token type from metric name
+                        metric_name = r["metric"].get("__name__", "")
+                        if "input" in metric_name:
+                            rate = family_rates.get("input", 3.0)
+                        else:
+                            rate = family_rates.get("output", 15.0)
+                        u["cost_usd"] = u.get("cost_usd", 0) + (val / 1_000_000) * rate
+                    except Exception:
+                        pass
+                cowork_count += 1
+        if cowork_count > 0:
+            print(f"Added CoWork 3P usage for {cowork_count} user-metric pairs")
+    except Exception as e:
+        # CoWork metrics are optional — don't fail quota monitoring if unavailable
+        print(f"CoWork PromQL query skipped (non-fatal): {e}")
+
+    return users
+
+
+def update_quota_metrics(usage_data):
+    """Atomically increment UserQuotaMetrics with delta from PromQL (like old MetricsAggregator)."""
+    now = datetime.now(timezone.utc)
+    current_month = now.strftime("%Y-%m")
+    current_date = now.strftime("%Y-%m-%d")
+    ttl = int((now.replace(day=28) + __import__("datetime").timedelta(days=32)).replace(day=1).timestamp())
+
+    for email, usage in usage_data.items():
+        delta = usage.get("total_tokens", 0)
+        if delta <= 0:
+            continue
+        try:
+            # Check if daily_date changed (new day = reset daily counter)
+            response = quota_table.get_item(Key={"pk": f"USER#{email}", "sk": f"MONTH#{current_month}"})
+            existing = response.get("Item", {})
+            daily_reset = existing.get("daily_date") != current_date
+
+            update_expr = "ADD total_tokens :delta, input_tokens :inp, output_tokens :out, cache_tokens :cache, estimated_cost :cost"
+            cost_delta = usage.get("cost_usd", 0)
+            expr_values = {
+                ":delta": Decimal(str(int(delta))),
+                ":inp": Decimal(str(int(usage.get("input_tokens", 0)))),
+                ":out": Decimal(str(int(usage.get("output_tokens", 0)))),
+                ":cache": Decimal(str(int(usage.get("cache_tokens", 0)))),
+                ":cost": Decimal(str(round(cost_delta, 6))),
+                ":ts": now.isoformat().replace("+00:00", "Z"),
+                ":ttl": ttl,
+                ":email": email,
+            }
+            if daily_reset:
+                update_expr += " SET daily_tokens = :delta, daily_cost_usd = :cost, daily_date = :date, last_updated = :ts, #ttl = :ttl, email = :email"
+                expr_values[":date"] = current_date
+            else:
+                update_expr += (
+                    ", daily_tokens :delta, daily_cost_usd :cost SET last_updated = :ts, #ttl = :ttl, email = :email"
+                )
+
+            quota_table.update_item(
+                Key={"pk": f"USER#{email}", "sk": f"MONTH#{current_month}"},
+                UpdateExpression=update_expr,
+                ExpressionAttributeNames={"#ttl": "ttl"},
+                ExpressionAttributeValues=expr_values,
+            )
+        except Exception as e:
+            print(f"Error updating quota for {email}: {e}")
+
+    print(f"Updated UserQuotaMetrics for {len(usage_data)} users")
+
+
+def _build_usage_entry(item, current_date):
+    """Build a usage_data entry for threshold checking, applying the stale-day guard.
+
+    Mirrors quota_check.get_user_usage: if the stored daily_date is not today
+    (UTC), the daily counter belongs to a prior day and must be treated as 0.
+    Otherwise an idle user whose daily_tokens froze above the limit gets a fresh
+    "daily exceeded" alert every new UTC day even though they had no activity.
+    Monthly (total_tokens) is unaffected — it accumulates across the whole month.
+    The same stale-day guard applies to daily_cost_usd for cost-based budgets.
+    """
+    daily_tokens = float(item.get("daily_tokens", 0))
+    daily_cost_usd = float(item.get("daily_cost_usd", 0))
+    daily_date = item.get("daily_date")
+    if daily_date != current_date:
+        daily_tokens = 0
+        daily_cost_usd = 0
+    return {
+        "total_tokens": float(item.get("total_tokens", 0)),
+        "daily_tokens": daily_tokens,
+        "estimated_cost": float(item.get("estimated_cost", 0)),
+        "daily_cost_usd": daily_cost_usd,
+        # Server-side metering (quota-metering stack). Absent = 0 -> the
+        # reconciliation step is a no-op for deployments without the stack.
+        "server_total_tokens": float(item.get("server_total_tokens", 0)),
+    }
+
+
+def reconcile_metering(usage_data):
+    """Reconcile client-reported (OTEL) usage against server-side metering.
+
+    For every user with server_* accrual (server_total_tokens > 0), publish
+    the month-to-date drift as a CloudWatch metric and return alert dicts for
+    users whose |drift| exceeds DRIFT_ALERT_PERCENT above the noise floor.
+    drift = (client_total - server_total) / max(server_total, 1): a stopped
+    sidecar (client freezes, server keeps counting) drives drift toward -100%.
+    Month-to-date cumulative values smooth window-alignment noise between the
+    15-min PromQL cadence and near-real-time log delivery.
+    """
+    metric_data = []
+    drift_alerts = []
+    for email, usage in usage_data.items():
+        server_total = usage.get("server_total_tokens", 0)
+        if server_total <= 0:
+            continue
+        client_total = usage.get("total_tokens", 0)
+        drift = (client_total - server_total) / max(server_total, 1)
+        drift_pct = drift * 100
+        metric_data.append(
+            {
+                "MetricName": "MeteringDrift",
+                "Dimensions": [{"Name": "user.email", "Value": email}],
+                "Value": drift_pct,
+                "Unit": "Percent",
+            }
+        )
+        if abs(drift_pct) > DRIFT_ALERT_PERCENT and server_total > DRIFT_MIN_SERVER_TOKENS:
+            if email.startswith("UNATTRIBUTED#"):
+                # Unattributed buckets (e.g. Cognito federation sessions) are
+                # structurally 100% drift (client=0) and contain '#', which
+                # breaks the sent-alert sk parsing — metric only, no alert.
+                continue
+            drift_alerts.append(
+                {
+                    "user": email,
+                    "alert_type": "metering_drift",
+                    "alert_level": "warning",
+                    "current_usage": int(client_total),
+                    "limit": int(server_total),
+                    "percentage": round(drift_pct, 1),
+                    "policy_info": "metering:reconciliation",
+                    "enforcement_mode": "alert",
+                }
+            )
+
+    # CloudWatch PutMetricData accepts max 1000 metrics per call
+    for i in range(0, len(metric_data), 1000):
+        try:
+            cloudwatch_client.put_metric_data(Namespace="GIP/Quota", MetricData=metric_data[i : i + 1000])
+        except Exception as e:
+            print(f"Error publishing metering drift metrics: {e}")
+
+    if metric_data:
+        print(f"Metering reconciliation: {len(metric_data)} users with server-side data, {len(drift_alerts)} drifting")
+    return drift_alerts
+
+
+def lambda_handler(event, context):
+    """Fetch usage from PromQL, update DynamoDB, check quotas, send alerts."""
+    print(f"Starting quota monitoring at {datetime.now(timezone.utc).isoformat()}")
+
+    now = datetime.now(timezone.utc)
+    month_name = now.strftime("%B %Y")
+    current_date = now.strftime("%Y-%m-%d")
+    days_in_month = (
+        31 if now.month in [1, 3, 5, 7, 8, 10, 12] else (30 if now.month != 2 else (29 if now.year % 4 == 0 else 28))
+    )
+    days_remaining = days_in_month - now.day
+
+    try:
+        # Step 1: Fetch delta usage from PromQL and increment DynamoDB
+        delta_data = fetch_usage_from_promql()
+        if delta_data:
+            update_quota_metrics(delta_data)
+
+        # Step 2: Read cumulative totals from DynamoDB for threshold checking
+        current_month = now.strftime("%Y-%m")
+        usage_data = {}
+        # NOTE: daily_date MUST be projected so we can apply the same stale-day
+        # guard that quota_check uses (quota_check/index.py). Without it, an idle
+        # user's frozen daily_tokens is read verbatim and re-alerted every new UTC
+        # day even though they had no activity.
+        projection = (
+            "email, total_tokens, daily_tokens, daily_date, estimated_cost, daily_cost_usd, server_total_tokens"
+        )
+        response = quota_table.scan(
+            FilterExpression=Attr("sk").eq(f"MONTH#{current_month}") & Attr("pk").begins_with("USER#"),
+            ProjectionExpression=projection,
+        )
+        for item in response.get("Items", []):
+            email = item.get("email")
+            if email:
+                usage_data[email] = _build_usage_entry(item, current_date)
+        while "LastEvaluatedKey" in response:
+            response = quota_table.scan(
+                FilterExpression=Attr("sk").eq(f"MONTH#{current_month}") & Attr("pk").begins_with("USER#"),
+                ProjectionExpression=projection,
+                ExclusiveStartKey=response["LastEvaluatedKey"],
+            )
+            for item in response.get("Items", []):
+                email = item.get("email")
+                if email:
+                    usage_data[email] = _build_usage_entry(item, current_date)
+
+        if not usage_data:
+            print("No usage data in DynamoDB")
+            return {"statusCode": 200, "body": "No usage data"}
+
+        # Step 3: Load policies
+        policies_cache = {}
+        if ENABLE_FINEGRAINED_QUOTAS and policies_table:
+            policies_cache = load_all_policies()
+
+        # Step 3: Check sent alerts
+        sent_alerts = get_sent_alerts(month_name)
+
+        # Step 4: Check each user against quotas
+        alerts_to_send = []
+        stats = {"total_users": 0, "over_80": 0, "over_90": 0, "exceeded": 0, "daily_exceeded": 0}
+
+        for email, usage in usage_data.items():
+            stats["total_users"] += 1
+            policy = resolve_user_quota(email, [], policies_cache)
+            if policy is None:
+                continue
+
+            total_tokens = usage.get("total_tokens", 0)
+            daily_tokens = usage.get("daily_tokens", 0)
+            estimated_cost = usage.get("estimated_cost", 0)
+            daily_cost_usd = usage.get("daily_cost_usd", 0)
+
+            alerts = check_limits_and_generate_alerts(
+                email=email,
+                total_tokens=total_tokens,
+                daily_tokens=daily_tokens,
+                policy=policy,
+                month_name=month_name,
+                current_date=current_date,
+                days_remaining=days_remaining,
+                days_in_month=days_in_month,
+                sent_alerts=sent_alerts,
+                estimated_cost=estimated_cost,
+                daily_cost_usd=daily_cost_usd,
+            )
+
+            monthly_pct = (
+                (total_tokens / policy["monthly_token_limit"]) * 100 if policy["monthly_token_limit"] > 0 else 0
+            )
+            if monthly_pct > 100:
+                stats["exceeded"] += 1
+            elif monthly_pct > 90:
+                stats["over_90"] += 1
+            elif monthly_pct > 80:
+                stats["over_80"] += 1
+            if policy.get("daily_token_limit") and daily_tokens > policy["daily_token_limit"]:
+                stats["daily_exceeded"] += 1
+
+            for alert in alerts:
+                alert_key = f"{email}#{alert['alert_type']}#{alert['alert_level']}"
+                if alert_key not in sent_alerts:
+                    alerts_to_send.append(alert)
+                    record_sent_alert(month_name, email, alert["alert_type"], alert["alert_level"], alert)
+
+        # Step 5: Reconcile client telemetry against server-side metering
+        # (no-op when no server_* attributes exist — metering stack absent).
+        for alert in reconcile_metering(usage_data):
+            alert_key = f"{alert['user']}#{alert['alert_type']}#{alert['alert_level']}"
+            if alert_key not in sent_alerts:
+                alerts_to_send.append(alert)
+                record_sent_alert(month_name, alert["user"], alert["alert_type"], alert["alert_level"], alert)
+
+        if alerts_to_send:
+            send_alerts(alerts_to_send)
+            print(f"Sent {len(alerts_to_send)} alerts")
+
+        print(
+            f"Summary - Total: {stats['total_users']}, Over 80%: {stats['over_80']}, Over 90%: {stats['over_90']}, Exceeded: {stats['exceeded']}"
+        )
+        return {"statusCode": 200, "body": json.dumps(stats)}
+
+    except Exception as e:
+        print(f"Error: {e}")
+        print(
+            json.dumps(
+                {
+                    "_aws": {
+                        "Timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+                        "CloudWatchMetrics": [
+                            {"Namespace": "GIP/Quota", "Dimensions": [[]], "Metrics": [{"Name": "MonitorFailures"}]}
+                        ],
+                    },
+                    "MonitorFailures": 1,
+                }
+            )
+        )
+        import traceback
+
+        traceback.print_exc()
+        return {"statusCode": 500, "body": json.dumps(f"Error: {e}")}
+
+
+def load_all_policies():
+    """Load all quota policies from QuotaPolicies table."""
+    policies = {}
+    if not policies_table:
+        return policies
+    try:
+        response = policies_table.scan(FilterExpression=Attr("sk").eq("CURRENT"))
+        for item in response.get("Items", []):
+            pt, ident = item.get("policy_type"), item.get("identifier")
+            if pt and ident:
+                policies[f"{pt}:{ident}"] = _policy_from_item(item)
+        while "LastEvaluatedKey" in response:
+            response = policies_table.scan(
+                FilterExpression=Attr("sk").eq("CURRENT"), ExclusiveStartKey=response["LastEvaluatedKey"]
+            )
+            for item in response.get("Items", []):
+                pt, ident = item.get("policy_type"), item.get("identifier")
+                if pt and ident:
+                    policies[f"{pt}:{ident}"] = _policy_from_item(item)
+    except Exception as e:
+        print(f"Error loading policies: {e}")
+    return policies
+
+
+def _policy_from_item(item):
+    """Normalize a stored quota policy for monitoring and alert evaluation."""
+    stored_mode = item.get("quota_mode")
+    has_cost_limit = any(float(item.get(field, 0) or 0) > 0 for field in ("monthly_cost_limit", "daily_cost_limit"))
+    quota_mode = stored_mode or ("cost" if has_cost_limit else "token")
+    # F-004: Policies written before quota_mode had no meaningful token cap.
+    legacy_cost_only = stored_mode is None and quota_mode == "cost"
+    return {
+        "policy_type": item.get("policy_type"),
+        "identifier": item.get("identifier"),
+        "quota_mode": quota_mode,
+        "monthly_token_limit": 0 if legacy_cost_only else int(item.get("monthly_token_limit", 0)),
+        "daily_token_limit": (
+            None
+            if legacy_cost_only
+            else int(item.get("daily_token_limit", 0))
+            if item.get("daily_token_limit")
+            else None
+        ),
+        "monthly_cost_limit": float(item.get("monthly_cost_limit", 0)) if item.get("monthly_cost_limit") else None,
+        "daily_cost_limit": float(item.get("daily_cost_limit", 0)) if item.get("daily_cost_limit") else None,
+        "warning_threshold_80": int(item.get("warning_threshold_80", 0)),
+        "warning_threshold_90": int(item.get("warning_threshold_90", 0)),
+        "enforcement_mode": item.get("enforcement_mode", "alert"),
+        "enabled": item.get("enabled", True),
+    }
+
+
+def resolve_user_quota(email, groups, policies_cache):
+    """Resolve effective quota policy: user > group > default > env defaults."""
+    if not ENABLE_FINEGRAINED_QUOTAS:
+        # Mirror quota_check: a policy applies when a token limit OR a cost
+        # budget is configured. In cost mode MONTHLY_TOKEN_LIMIT is 0, so the
+        # cost limits alone must be enough to return a policy.
+        if MONTHLY_TOKEN_LIMIT > 0 or MONTHLY_COST_LIMIT_USD > 0 or DAILY_COST_LIMIT_USD > 0:
+            return {
+                "policy_type": "default",
+                "identifier": "environment",
+                "quota_mode": QUOTA_MODE,
+                "monthly_token_limit": MONTHLY_TOKEN_LIMIT,
+                "daily_token_limit": None,
+                "monthly_cost_limit": MONTHLY_COST_LIMIT_USD,
+                "daily_cost_limit": DAILY_COST_LIMIT_USD,
+                "warning_threshold_80": WARNING_THRESHOLD_80,
+                "warning_threshold_90": WARNING_THRESHOLD_90,
+                "enforcement_mode": "alert",
+                "enabled": True,
+            }
+        return None
+    user_key = f"user:{email}"
+    if user_key in policies_cache and policies_cache[user_key].get("enabled"):
+        return policies_cache[user_key]
+    group_policies = [
+        policies_cache[f"group:{g}"]
+        for g in (groups or [])
+        if f"group:{g}" in policies_cache and policies_cache[f"group:{g}"].get("enabled")
+    ]
+    if group_policies:
+        return min(
+            group_policies,
+            key=lambda p: (
+                p.get("monthly_cost_limit") or float("inf")
+                if p.get("quota_mode") == "cost"
+                else p.get("monthly_token_limit") or float("inf")
+            ),
+        )
+    default_key = "default:default"
+    if default_key in policies_cache and policies_cache[default_key].get("enabled"):
+        return policies_cache[default_key]
+    return None
+
+
+def check_limits_and_generate_alerts(
+    email,
+    total_tokens,
+    daily_tokens,
+    policy,
+    month_name,
+    current_date,
+    days_remaining,
+    days_in_month,
+    sent_alerts,
+    estimated_cost=0,
+    daily_cost_usd=0,
+):
+    """Check limits and generate alert dicts.
+
+    Token limits (monthly/daily) and cost budgets (monthly_cost/daily_cost) are
+    checked independently: a policy may carry any combination. A limit of 0
+    means "not configured" and is skipped — in cost mode monthly_token_limit is
+    0, which previously produced a bogus "exceeded" token alert for any usage.
+    """
+    alerts = []
+    policy_info = f"{policy['policy_type']}:{policy['identifier']}"
+    enforcement_mode = policy.get("enforcement_mode", "alert")
+    monthly_limit = policy["monthly_token_limit"]
+    monthly_pct = (total_tokens / monthly_limit) * 100 if monthly_limit > 0 else 0
+    daily_average = total_tokens / max(1, int(current_date.split("-")[2]))
+    projected_total = daily_average * days_in_month
+
+    level = None
+    if monthly_limit > 0:
+        if total_tokens > monthly_limit:
+            level = "exceeded"
+        elif total_tokens > policy["warning_threshold_90"]:
+            level = "critical"
+        elif total_tokens > policy["warning_threshold_80"]:
+            level = "warning"
+
+    if level and f"{email}#monthly#{level}" not in sent_alerts:
+        alerts.append(
+            {
+                "user": email,
+                "alert_type": "monthly",
+                "alert_level": level,
+                "current_usage": int(total_tokens),
+                "limit": monthly_limit,
+                "percentage": round(monthly_pct, 1),
+                "month": month_name,
+                "days_remaining": days_remaining,
+                "daily_average": int(daily_average),
+                "projected_total": int(projected_total),
+                "policy_info": policy_info,
+                "enforcement_mode": enforcement_mode,
+            }
+        )
+
+    daily_limit = policy.get("daily_token_limit")
+    if daily_limit:
+        daily_pct = (daily_tokens / daily_limit) * 100 if daily_limit > 0 else 0
+        dlevel = None
+        if daily_tokens > daily_limit:
+            dlevel = "exceeded"
+        elif daily_tokens > (daily_limit * 0.9):
+            dlevel = "critical"
+        elif daily_tokens > (daily_limit * 0.8):
+            dlevel = "warning"
+        if dlevel and f"{email}#daily#{current_date}#{dlevel}" not in sent_alerts:
+            alerts.append(
+                {
+                    "user": email,
+                    "alert_type": "daily",
+                    "alert_level": dlevel,
+                    "current_usage": int(daily_tokens),
+                    "limit": daily_limit,
+                    "percentage": round(daily_pct, 1),
+                    "date": current_date,
+                    "policy_info": policy_info,
+                    "enforcement_mode": enforcement_mode,
+                }
+            )
+
+    # Cost-based budget alerts ($ USD) — same 80/90/100 tiers as token alerts.
+    monthly_cost_limit = float(policy.get("monthly_cost_limit") or 0)
+    if monthly_cost_limit > 0:
+        cost_pct = (estimated_cost / monthly_cost_limit) * 100
+        clevel = None
+        if estimated_cost > monthly_cost_limit:
+            clevel = "exceeded"
+        elif estimated_cost > (monthly_cost_limit * 0.9):
+            clevel = "critical"
+        elif estimated_cost > (monthly_cost_limit * 0.8):
+            clevel = "warning"
+        if clevel and f"{email}#monthly_cost#{clevel}" not in sent_alerts:
+            alerts.append(
+                {
+                    "user": email,
+                    "alert_type": "monthly_cost",
+                    "alert_level": clevel,
+                    "current_usage": round(estimated_cost, 2),
+                    "limit": monthly_cost_limit,
+                    "percentage": round(cost_pct, 1),
+                    "month": month_name,
+                    "days_remaining": days_remaining,
+                    "policy_info": policy_info,
+                    "enforcement_mode": enforcement_mode,
+                }
+            )
+
+    daily_cost_limit = float(policy.get("daily_cost_limit") or 0)
+    if daily_cost_limit > 0:
+        daily_cost_pct = (daily_cost_usd / daily_cost_limit) * 100
+        dclevel = None
+        if daily_cost_usd > daily_cost_limit:
+            dclevel = "exceeded"
+        elif daily_cost_usd > (daily_cost_limit * 0.9):
+            dclevel = "critical"
+        elif daily_cost_usd > (daily_cost_limit * 0.8):
+            dclevel = "warning"
+        if dclevel and f"{email}#daily_cost#{current_date}#{dclevel}" not in sent_alerts:
+            alerts.append(
+                {
+                    "user": email,
+                    "alert_type": "daily_cost",
+                    "alert_level": dclevel,
+                    "current_usage": round(daily_cost_usd, 2),
+                    "limit": daily_cost_limit,
+                    "percentage": round(daily_cost_pct, 1),
+                    "date": current_date,
+                    "policy_info": policy_info,
+                    "enforcement_mode": enforcement_mode,
+                }
+            )
+    return alerts
+
+
+def get_sent_alerts(month_name):
+    """Get alerts already sent this month."""
+    sent = set()
+    try:
+        month_prefix = datetime.now(timezone.utc).strftime("%Y-%m")
+        response = quota_table.query(
+            KeyConditionExpression=Key("pk").eq("ALERTS") & Key("sk").begins_with(f"{month_prefix}#ALERT#")
+        )
+        for item in response.get("Items", []):
+            parts = item["sk"].split("#")
+            if len(parts) >= 5:
+                email, atype, alevel = parts[2], parts[3], parts[4]
+                if atype in ("daily", "daily_cost") and len(parts) >= 6:
+                    sent.add(f"{email}#{atype}#{parts[5]}#{alevel}")
+                else:
+                    sent.add(f"{email}#{atype}#{alevel}")
+        while "LastEvaluatedKey" in response:
+            response = quota_table.query(
+                KeyConditionExpression=Key("pk").eq("ALERTS") & Key("sk").begins_with(f"{month_prefix}#ALERT#"),
+                ExclusiveStartKey=response["LastEvaluatedKey"],
+            )
+            for item in response.get("Items", []):
+                parts = item["sk"].split("#")
+                if len(parts) >= 5:
+                    email, atype, alevel = parts[2], parts[3], parts[4]
+                    if atype in ("daily", "daily_cost") and len(parts) >= 6:
+                        sent.add(f"{email}#{atype}#{parts[5]}#{alevel}")
+                    else:
+                        sent.add(f"{email}#{atype}#{alevel}")
+    except Exception as e:
+        print(f"Error checking sent alerts: {e}")
+    return sent
+
+
+def record_sent_alert(month_name, email, alert_type, alert_level, alert_data):
+    """Record sent alert to prevent duplicates."""
+    try:
+        month_prefix = datetime.now(timezone.utc).strftime("%Y-%m")
+        if alert_type in ("daily", "daily_cost"):
+            date = alert_data.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+            sk = f"{month_prefix}#ALERT#{email}#{alert_type}#{alert_level}#{date}"
+        else:
+            sk = f"{month_prefix}#ALERT#{email}#{alert_type}#{alert_level}"
+        quota_table.put_item(
+            Item={
+                "pk": "ALERTS",
+                "sk": sk,
+                "sent_at": datetime.now(timezone.utc).isoformat(),
+                "email": email,
+                "alert_type": alert_type,
+                "alert_level": alert_level,
+                "usage_at_alert": Decimal(str(alert_data.get("current_usage", 0))),
+                "ttl": int(datetime.now(timezone.utc).timestamp()) + (60 * 86400),
+            }
+        )
+    except Exception as e:
+        print(f"Error recording alert: {e}")
+
+
+def send_alerts(alerts):
+    """Send alerts via SNS."""
+    if not SNS_TOPIC_ARN:
+        print("SNS_TOPIC_ARN not configured")
+        return
+    for alert in alerts:
+        try:
+            level_prefix = {"warning": "WARNING", "critical": "CRITICAL", "exceeded": "EXCEEDED"}.get(
+                alert["alert_level"], "ALERT"
+            )
+            type_label = {
+                "monthly": "Monthly Token Quota",
+                "daily": "Daily Token Quota",
+                "monthly_cost": "Monthly Budget",
+                "daily_cost": "Daily Budget",
+                "metering_drift": "Metering Drift",
+            }.get(alert["alert_type"], "Quota")
+            if alert["alert_type"] in ("monthly_cost", "daily_cost"):
+                usage_str = f"${alert['current_usage']:,.2f} / ${alert['limit']:,.2f}"
+            elif alert["alert_type"] == "metering_drift":
+                # current_usage = client-reported tokens, limit = server-metered tokens
+                usage_str = f"client {alert['current_usage']:,} vs server {alert['limit']:,} tokens"
+            else:
+                usage_str = f"{alert['current_usage']:,} / {alert['limit']:,}"
+            subject = f"Claude Code {level_prefix} - {type_label} - {alert['percentage']:.0f}%"
+            message = (
+                f"USER: {alert['user']}\nALERT: {type_label} - {alert['alert_level'].upper()}\n"
+                f"Usage: {usage_str} ({alert['percentage']:.1f}%)\n"
+                f"Policy: {alert.get('policy_info', 'default')}\n"
+                f"Enforcement: {alert.get('enforcement_mode', 'alert')}"
+            )
+            sns_client.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject, Message=message)
+        except Exception as e:
+            print(f"Error sending alert for {alert['user']}: {e}")

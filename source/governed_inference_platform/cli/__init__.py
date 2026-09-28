@@ -1,0 +1,143 @@
+# ABOUTME: CLI module for the Governed Inference Platform
+# ABOUTME: Provides command-line interface for deployment and management
+
+"""Command-line interface for the Governed Inference Platform."""
+
+from cleo.application import Application
+
+from .commands.builds import BuildsCommand
+from .commands.cleanup import CleanupCommand
+from .commands.console import ConsoleCommand
+from .commands.context import (
+    ConfigCommand,
+    ConfigExportCommand,
+    ConfigImportCommand,
+    ConfigValidateCommand,
+    ContextCommand,
+    ContextCurrentCommand,
+    ContextListCommand,
+    ContextShowCommand,
+    ContextUseCommand,
+)
+from .commands.cowork import CoworkGenerateCommand
+from .commands.deploy import DeployCommand
+from .commands.destroy import DestroyCommand
+from .commands.distribute import DistributeCommand
+from .commands.doctor import DoctorCommand
+from .commands.init import InitCommand
+from .commands.memory_cmd import MemoryForgetUserCommand, MemoryStatusCommand
+from .commands.models_cmd import ModelsCheckCommand, ModelsCommand
+from .commands.package import PackageCommand
+from .commands.package_cb import PackageCbCommand
+from .commands.quota import (
+    QuotaCommand,
+    QuotaDeleteCommand,
+    QuotaExportCommand,
+    QuotaImportCommand,
+    QuotaListCommand,
+    QuotaSetCommand,
+    QuotaSetDefaultCommand,
+    QuotaSetGroupCommand,
+    QuotaSetUserCommand,
+    QuotaShowCommand,
+    QuotaUnblockCommand,
+    QuotaUsageCommand,
+)
+from .commands.skill_eval import SkillsEvalCommand
+from .commands.skills_cmd import (
+    SkillsApproveCommand,
+    SkillsCommand,
+    SkillsListCommand,
+    SkillsPublishCommand,
+    SkillsSyncCommand,
+)
+from .commands.status import StatusCommand
+from .commands.test import TestCommand
+
+# TokenCommand temporarily disabled - not implemented
+
+
+def create_application() -> Application:
+    """Create the CLI application."""
+    application = Application("gip", "1.0.0")
+
+    # Add commands
+    application.add(InitCommand())
+    application.add(DeployCommand())
+    application.add(StatusCommand())
+    application.add(TestCommand())
+    application.add(PackageCommand())
+    application.add(PackageCbCommand())
+    application.add(BuildsCommand())
+    application.add(DistributeCommand())
+    application.add(DestroyCommand())
+    application.add(DoctorCommand())
+    application.add(CleanupCommand())
+    application.add(ConsoleCommand())
+    application.add(CoworkGenerateCommand())
+    # application.add(TokenCommand())  # Temporarily disabled
+
+    # Model catalog commands
+    application.add(ModelsCommand())
+    application.add(ModelsCheckCommand())
+
+    # Memory management commands (opt-in AgentCore Memory stack)
+    application.add(MemoryStatusCommand())
+    application.add(MemoryForgetUserCommand())
+
+    # Context management commands
+    application.add(ContextCommand())
+    application.add(ContextListCommand())
+    application.add(ContextCurrentCommand())
+    application.add(ContextUseCommand())
+    application.add(ContextShowCommand())
+
+    # Config management commands
+    application.add(ConfigCommand())
+    application.add(ConfigValidateCommand())
+    application.add(ConfigExportCommand())
+    application.add(ConfigImportCommand())
+
+    # Quota management commands
+    application.add(QuotaCommand())
+    application.add(QuotaSetCommand())
+    application.add(QuotaSetUserCommand())
+    application.add(QuotaSetGroupCommand())
+    application.add(QuotaSetDefaultCommand())
+    application.add(QuotaListCommand())
+    application.add(QuotaDeleteCommand())
+    application.add(QuotaShowCommand())
+    application.add(QuotaUsageCommand())
+    application.add(QuotaUnblockCommand())
+    application.add(QuotaExportCommand())
+    application.add(QuotaImportCommand())
+
+    # Skills registry commands
+    application.add(SkillsCommand())
+    application.add(SkillsPublishCommand())
+    application.add(SkillsListCommand())
+    application.add(SkillsApproveCommand())
+    application.add(SkillsSyncCommand())
+    application.add(SkillsEvalCommand())
+
+    return application
+
+
+def main():
+    """Main entry point for the CLI."""
+    # Use OS certificate store if truststore is available.
+    # Fixes SSL errors with corporate proxies (Zscaler, Netskope, etc.)
+    # that intercept HTTPS and re-sign with their own CA.
+    try:
+        import truststore
+
+        truststore.inject_into_ssl()
+    except ImportError:
+        pass
+
+    application = create_application()
+    application.run()
+
+
+if __name__ == "__main__":
+    main()

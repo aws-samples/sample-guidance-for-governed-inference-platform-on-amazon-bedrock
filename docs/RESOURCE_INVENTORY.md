@@ -1,0 +1,1 @@
+../assets/docs/RESOURCE_INVENTORY.md

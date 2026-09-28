@@ -1,0 +1,180 @@
+# ABOUTME: CoWork 3P command for generating Claude Cowork MDM configurations
+# ABOUTME: Standalone command that uses shared utilities from cli/utils/cowork_3p.py
+
+"""CoWork 3P command - Generate Claude Cowork MDM configuration files."""
+
+from pathlib import Path
+
+from cleo.commands.command import Command
+from cleo.helpers import option
+from rich.console import Console
+from rich.panel import Panel
+
+from governed_inference_platform.cli.utils.cowork_3p import (
+    add_monitoring_config,
+    add_websearch_mcp_config,
+    build_mdm_config,
+    derive_model_aliases,
+    generate_json,
+    generate_mobileconfig,
+    generate_reg_file,
+)
+from governed_inference_platform.config import Config
+from governed_inference_platform.models import get_source_region_for_profile
+
+
+class CoworkGenerateCommand(Command):
+    """
+    Generate Claude Cowork 3P MDM configuration files
+
+    cowork generate
+    """
+
+    name = "cowork generate"
+    description = "Generate Claude Cowork 3P MDM configuration files (JSON, macOS, Windows)"
+
+    options = [
+        option(
+            "profile",
+            description="Configuration profile to use (defaults to active profile)",
+            flag=False,
+            default=None,
+        ),
+        option(
+            "output",
+            "o",
+            description="Output directory (defaults to dist/cowork-3p/)",
+            flag=False,
+            default=None,
+        ),
+        option(
+            "format",
+            "f",
+            description="Output format: all, json, mobileconfig, reg (default: all)",
+            flag=False,
+            default="all",
+        ),
+        option(
+            "models",
+            "m",
+            description="Comma-separated model aliases (default: auto-detect from profile)",
+            flag=False,
+            default=None,
+        ),
+    ]
+
+    def handle(self) -> int:
+        """Execute the cowork generate command."""
+        console = Console()
+
+        console.print(
+            Panel(
+                "[bold]Claude Cowork 3P MDM Configuration Generator[/bold]\n"
+                "Generates MDM configuration files for Claude Desktop with Amazon Bedrock",
+                border_style="cyan",
+            )
+        )
+
+        # Load configuration
+        config = Config.load()
+        profile_name = self.option("profile") or config.active_profile or "gip"
+        profile = config.get_profile(profile_name)
+
+        if not profile:
+            console.print("[red]No deployment found. Run 'poetry run gip init' first.[/red]")
+            return 1
+
+        # Determine output directory
+        output_dir_str = self.option("output")
+        if output_dir_str:
+            output_dir = Path(output_dir_str)
+        else:
+            output_dir = Path("dist") / "cowork-3p"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        output_format = self.option("format")
+        valid_formats = ["all", "json", "mobileconfig", "reg", "admx", "ps1"]
+        if output_format not in valid_formats:
+            console.print(f"[red]Invalid format '{output_format}'. Must be one of: {', '.join(valid_formats)}[/red]")
+            return 1
+
+        # Determine Bedrock region
+        bedrock_region = get_source_region_for_profile(profile)
+
+        # Derive model aliases
+        models_option = self.option("models")
+        if models_option:
+            model_aliases = [m.strip() for m in models_option.split(",")]
+        else:
+            model_aliases = derive_model_aliases()
+
+        console.print(f"\n[dim]Profile: {profile_name}[/dim]")
+        console.print(f"[dim]Bedrock region: {bedrock_region}[/dim]")
+        console.print(f"[dim]Models: {', '.join(model_aliases)}[/dim]")
+        console.print(f"[dim]Output: {output_dir}[/dim]")
+
+        # Build the MDM configuration using shared utility
+        mdm_config = build_mdm_config(
+            bedrock_region=bedrock_region,
+            model_aliases=model_aliases,
+            profile_name=profile_name,
+            extra_keys=profile.cowork_3p_extra_keys or None,
+            credential_mode=getattr(profile, "cowork_credential_mode", "helper"),
+            credential_helper_ttl_sec=getattr(profile, "cowork_credential_helper_ttl_sec", 3500),
+        )
+
+        # Add monitoring OTLP endpoint if available
+        add_monitoring_config(mdm_config, profile, console)
+
+        # Add the AgentCore web search gateway as a managed MCP server (if enabled)
+        add_websearch_mcp_config(mdm_config, profile, console)
+
+        # Generate requested formats
+        generated = []
+
+        if output_format in ("all", "json"):
+            generate_json(output_dir, mdm_config)
+            generated.append("cowork-3p-config.json")
+            console.print("[green]✓[/green] Generated cowork-3p-config.json")
+
+        if output_format in ("all", "mobileconfig"):
+            generate_mobileconfig(output_dir, mdm_config)
+            generated.append("cowork-3p.mobileconfig")
+            console.print("[green]✓[/green] Generated cowork-3p.mobileconfig (macOS)")
+
+        if output_format in ("all", "reg"):
+            generate_reg_file(output_dir, mdm_config)
+            generated.append("cowork-3p.reg")
+            console.print("[green]✓[/green] Generated cowork-3p.reg (Windows)")
+
+        if output_format in ("all", "admx"):
+            from governed_inference_platform.cli.utils.cowork_3p import generate_admx
+
+            generate_admx(output_dir, mdm_config)
+            generated.append("ClaudeCowork3P.admx")
+            generated.append("en-US/ClaudeCowork3P.adml")
+            console.print("[green]✓[/green] Generated ClaudeCowork3P.admx + .adml (Group Policy / Intune)")
+
+        if output_format in ("all", "ps1"):
+            from governed_inference_platform.cli.utils.cowork_3p import generate_intune_script
+
+            generate_intune_script(output_dir, mdm_config)
+            generated.append("Set-CoworkPolicy.ps1")
+            console.print("[green]✓[/green] Generated Set-CoworkPolicy.ps1 (Intune platform script)")
+
+        # Summary
+        console.print(f"\n[bold green]Generated {len(generated)} file(s) in {output_dir}/[/bold green]")
+        for f in generated:
+            console.print(f"  • {f}")
+
+        console.print("\n[bold]Next steps:[/bold]")
+        console.print("  macOS: Deploy .mobileconfig via Jamf, Kandji, or Mosyle")
+        console.print("  Windows (GPO/Intune): Import .admx template or run Set-CoworkPolicy.ps1")
+        console.print("  Windows (manual): Deploy .reg via Group Policy or SCCM")
+        console.print("  Manual: Import cowork-3p-config.json via Claude Desktop Setup UI")
+        console.print(
+            "\n[dim]Docs: https://support.claude.com/en/articles/14680741"
+            "-install-and-configure-claude-cowork-with-third-party-platforms[/dim]"
+        )
+
+        return 0

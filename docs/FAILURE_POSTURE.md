@@ -1,0 +1,1 @@
+../assets/docs/FAILURE_POSTURE.md

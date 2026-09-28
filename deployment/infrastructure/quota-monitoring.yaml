@@ -1,0 +1,1125 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Claude Code quota monitoring stack for per-user token limits and alerts with fine-grained policy support'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Quota mode"
+        Parameters:
+          - QuotaMode
+      - Label:
+          default: "Token limits"
+        Parameters:
+          - MonthlyTokenLimit
+          - DailyTokenLimit
+          - WarningThreshold80
+          - WarningThreshold90
+      - Label:
+          default: "Cost limits (cost mode only)"
+        Parameters:
+          - MonthlyCostLimitUsd
+          - DailyCostLimitUsd
+      - Label:
+          default: "Enforcement"
+        Parameters:
+          - MonthlyEnforcementMode
+          - DailyEnforcementMode
+          - EnableFinegrainedQuotas
+          - MeteringMode
+      - Label:
+          default: "Bypass detection"
+        Parameters:
+          - EnableBypassDetection
+          - BypassDetectionLookbackMinutes
+      - Label:
+          default: "Alerting"
+        Parameters:
+          - AlertTopicArn
+          - AlertTopicKmsKeyArn
+      - Label:
+          default: "Quota API authentication"
+        Parameters:
+          - OidcIssuerUrl
+          - OidcClientId
+          - CorsAllowedOrigins
+    ParameterLabels:
+      QuotaMode:
+        default: "Quota accounting mode (tokens or estimated cost)"
+      MonthlyTokenLimit:
+        default: "Default monthly token limit per user (0 disables in cost mode)"
+      DailyTokenLimit:
+        default: "Default daily token limit per user (0 disables)"
+      WarningThreshold80:
+        default: "Warning threshold at 80% (tokens)"
+      WarningThreshold90:
+        default: "Warning threshold at 90% (tokens)"
+      MonthlyCostLimitUsd:
+        default: "Monthly cost limit per user (USD, 0 = none)"
+      DailyCostLimitUsd:
+        default: "Daily cost limit per user (USD, 0 = none)"
+      MonthlyEnforcementMode:
+        default: "Monthly limit enforcement (alert or block)"
+      DailyEnforcementMode:
+        default: "Daily limit enforcement (alert or block)"
+      EnableFinegrainedQuotas:
+        default: "Enable fine-grained quota policies"
+      MeteringMode:
+        default: "Server-side metering mode"
+      EnableBypassDetection:
+        default: "Detect telemetry bypass"
+      BypassDetectionLookbackMinutes:
+        default: "Bypass detection lookback (minutes)"
+      AlertTopicArn:
+        default: "Existing SNS alert topic ARN (empty = create one)"
+      AlertTopicKmsKeyArn:
+        default: "KMS key ARN of the existing alert topic (empty = not encrypted)"
+      OidcIssuerUrl:
+        default: "OIDC issuer URL (empty disables JWT auth)"
+      OidcClientId:
+        default: "OIDC client ID (token audience)"
+      CorsAllowedOrigins:
+        default: "Allowed CORS origins"
+
+Parameters:
+  # F-004: Cost mode passes 0 because token limits do not apply.
+  MonthlyTokenLimit:
+    Type: Number
+    Default: 10000000
+    Description: >-
+      Default monthly token limit per user (10M tokens). Set to 0 when
+      QuotaMode=cost.
+    MinValue: 0
+    MaxValue: 1000000000
+
+  WarningThreshold80:
+    Type: Number
+    Default: 8000000
+    Description: Default warning threshold at 80% (8M tokens) - used when no policy is defined
+
+  WarningThreshold90:
+    Type: Number
+    Default: 9000000
+    Description: Default warning threshold at 90% (9M tokens) - used when no policy is defined
+
+  DailyTokenLimit:
+    Type: Number
+    Default: 366667
+    Description: Default daily token limit per user (monthly/30 * 1.1) - 0 to disable daily limits
+    MinValue: 0
+    MaxValue: 100000000
+
+  DailyEnforcementMode:
+    Type: String
+    Default: 'alert'
+    AllowedValues:
+      - 'alert'
+      - 'block'
+    Description: Enforcement mode for daily limits - alert (warn only) or block (deny access)
+
+  MonthlyEnforcementMode:
+    Type: String
+    Default: 'block'
+    AllowedValues:
+      - 'alert'
+      - 'block'
+    Description: Enforcement mode for monthly limits - alert (warn only) or block (deny access)
+
+  EnableFinegrainedQuotas:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable fine-grained quota policies (user/group/default levels)
+
+  EnableBypassDetection:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      Detect users invoking Bedrock without a running OTEL sidecar by joining
+      CloudTrail Bedrock activity against OTEL-reported usage. Reports via
+      CloudWatch metrics and SNS alerts (detective control, does not block).
+      Opt-in compliance/audit feature; applies to sidecar monitoring mode.
+
+  BypassDetectionLookbackMinutes:
+    Type: Number
+    Default: 15
+    MinValue: 5
+    MaxValue: 60
+    Description: Lookback window (minutes) for bypass detection - should match the detection schedule
+
+  QuotaMode:
+    Type: String
+    Default: 'token'
+    AllowedValues:
+      - 'token'
+      - 'cost'
+    Description: >-
+      Quota enforcement mode. 'token' counts raw tokens (existing behavior).
+      'cost' converts tokens to estimated USD using Bedrock pricing rates and
+      compares against dollar-denominated limits.
+
+  MonthlyCostLimitUsd:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: >-
+      Monthly cost limit per user in USD (cost mode only). 0 = no limit.
+      Example: 500 = block at $500/month estimated spend.
+
+  DailyCostLimitUsd:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: >-
+      Daily cost limit per user in USD (cost mode only). 0 = no limit.
+      Example: 50 = block at $50/day estimated spend.
+
+  MeteringMode:
+    Type: String
+    Default: 'shadow'
+    AllowedValues:
+      - 'shadow'
+      - 'max'
+    Description: >-
+      Server-side metering mode (requires the quota-metering stack).
+      'shadow' (default) collects/reconciles server-side figures without
+      changing enforcement — identical to pre-metering behavior. 'max'
+      enforces on max(client, server) so a stopped sidecar no longer reduces
+      enforced usage. 'strict' is deferred (Phase 3 of the metering design).
+
+  # JWT Authentication Parameters for Quota Check API
+  OidcIssuerUrl:
+    Type: String
+    Default: ''
+    Description: OIDC provider issuer URL for JWT validation (e.g., https://company.okta.com) - leave empty to disable JWT auth
+
+  OidcClientId:
+    Type: String
+    Default: ''
+    Description: OIDC client ID (audience) for JWT validation
+
+  CorsAllowedOrigins:
+    Type: CommaDelimitedList
+    Default: '*'
+    Description: >-
+      Allowed CORS origins for the quota check API. Callers are CLI binaries
+      (credential-process), not browsers, so CORS is not required for normal
+      operation; admins can set a dummy origin (e.g. https://cors-disabled.invalid)
+      to disable browser access. Default '*' preserves current behavior.
+
+  AlertTopicArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Existing SNS topic ARN to reuse for quota alerts (e.g. a pre-encrypted
+      topic). Leave empty to create the dedicated gip-quota-alerts topic,
+      encrypted with a stack-owned KMS key.
+      The customer-owned topic policy must allow CloudWatch alarms
+      (cloudwatch.amazonaws.com) and, for a cross-account topic, this stack's
+      Lambda publisher roles to publish. Supply AlertTopicKmsKeyArn when the
+      topic is encrypted.
+
+  AlertTopicKmsKeyArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[a-z\-]+:kms:[a-z0-9\-]+:[0-9]{12}:key/[a-zA-Z0-9\-]+$'
+    Description: >-
+      KMS key ARN that encrypts AlertTopicArn (empty = the external topic is
+      not encrypted). Grants QuotaMonitorRole and, when enabled,
+      SidecarMonitorRole kms:GenerateDataKey and kms:Decrypt on that key.
+      The customer must also permit those roles in the SNS topic policy and
+      KMS key policy, and permit cloudwatch.amazonaws.com in both policies for
+      alarm delivery. For a cross-account topic or key, both resource policies
+      remain the customer's responsibility. Ignored when AlertTopicArn is empty.
+
+Conditions:
+  HasJwtAuth: !Not [!Equals [!Ref OidcIssuerUrl, '']]
+  NoJwtAuth: !Equals [!Ref OidcIssuerUrl, '']
+  BypassDetectionEnabled: !Equals [!Ref EnableBypassDetection, 'true']
+  CreateTopic: !Equals [!Ref AlertTopicArn, '']
+  HasAlertTopicKmsKey: !Not [!Equals [!Ref AlertTopicKmsKeyArn, '']]
+  UsesExternalTopicKey: !And [!Not [!Condition CreateTopic], !Condition HasAlertTopicKmsKey]
+  BypassDetectionWithCreatedTopic: !And [!Condition BypassDetectionEnabled, !Condition CreateTopic]
+  BypassDetectionWithExternalTopicKey: !And [!Condition BypassDetectionEnabled, !Condition UsesExternalTopicKey]
+  HasEffectiveAlertTopicKmsKey: !Or [!Condition CreateTopic, !Condition UsesExternalTopicKey]
+
+Resources:
+  # DynamoDB table for quota policies (user, group, default levels)
+  QuotaPolicies:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: QuotaPolicies
+      BillingMode: PAY_PER_REQUEST
+      # AWS-managed key, named explicitly (the same key SSEType: KMS selects
+      # by default). No cost and no key-policy management.
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: alias/aws/dynamodb
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: policy_type
+          AttributeType: S
+        - AttributeName: identifier
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: PolicyTypeIndex
+          KeySchema:
+            - AttributeName: policy_type
+              KeyType: HASH
+            - AttributeName: identifier
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Name
+          Value: QuotaPolicies
+        - Key: Purpose
+          Value: Fine-grained quota policy definitions
+        - Key: gip:service
+          Value: quota-enforcement
+        - Key: gip:cell
+          Value: !Sub '${AWS::AccountId}:${AWS::Region}'
+
+  # DynamoDB table for user quota tracking
+  UserQuotaMetrics:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: UserQuotaMetrics
+      BillingMode: PAY_PER_REQUEST
+      # AWS-managed key, named explicitly (the same key SSEType: KMS selects
+      # by default). No cost and no key-policy management.
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: alias/aws/dynamodb
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Name
+          Value: UserQuotaMetrics
+        - Key: Purpose
+          Value: User quota monitoring and alerts
+        - Key: gip:service
+          Value: quota-enforcement
+        - Key: gip:cell
+          Value: !Sub '${AWS::AccountId}:${AWS::Region}'
+
+  # Customer-managed key for the quota alert topic. The AWS-managed aws/sns
+  # key cannot be used here: its key policy is fixed and does not grant
+  # cloudwatch.amazonaws.com / events.amazonaws.com, so the three alarms below
+  # (and the model-lifecycle Health rule that reuses this topic) could not
+  # publish (SNS Developer Guide, "Enable compatibility between event sources
+  # from AWS services and encrypted topics":
+  # https://docs.aws.amazon.com/sns/latest/dg/sns-key-management.html).
+  # One statement per AWS-service publisher of QuotaAlertTopic; the Lambda
+  # publishers are granted through QuotaMonitorKmsPolicy /
+  # SidecarMonitorKmsPolicy on their execution roles instead (the account-root
+  # statement delegates that to IAM). No rule in THIS template targets the
+  # topic, but the default `gip deploy` wiring hands it to the model-lifecycle
+  # stack as AlertTopicArn, whose HealthEventsRule (EventBridge) targets it -
+  # hence the EventBridgePublish statement.
+  QuotaAlertTopicKey:
+    Type: AWS::KMS::Key
+    Condition: CreateTopic
+    Properties:
+      Description: CMK for the gip-quota-alerts SNS topic (per-user quota alerts)
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          # SNS itself, bound to this topic via the encryption context
+          # (sns-enable-encryption-for-topic, "Permissions for custom KMS keys").
+          - Sid: SnsServiceUse
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:EncryptionContext:aws:sns:topicArn': !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:gip-quota-alerts'
+          # model-lifecycle HealthEventsRule (EventBridge) when that stack
+          # reuses this topic (gip deploy default with quota monitoring on).
+          # Deliberately no aws:Source* condition: the SNS Developer Guide
+          # states aws:SourceAccount / aws:SourceArn / aws:SourceOrgID are not
+          # supported for EventBridge-to-encrypted-topic delivery. Publishing
+          # itself is still gated by the topic access policy.
+          - Sid: EventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: '*'
+          # QuotaCheckErrorsAlarm, QuotaMonitorErrorsAlarm, QuotaApi5xxAlarm
+          # (and the same-account alarms of the metering and model-lifecycle
+          # stacks when they reuse this topic through their AlarmTopicArn /
+          # AlertTopicArn parameters).
+          - Sid: CloudWatchAlarmsPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  QuotaAlertTopicKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: CreateTopic
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-quota-alerts'
+      TargetKeyId: !Ref QuotaAlertTopicKey
+
+  # SNS Topic for quota alerts. TopicName is unchanged from the unencrypted
+  # version so existing subscriptions survive the update (KmsMasterKeyId
+  # updates without interruption).
+  QuotaAlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateTopic
+    Properties:
+      TopicName: gip-quota-alerts
+      DisplayName: Claude Code Quota Alerts
+      KmsMasterKeyId: !Ref QuotaAlertTopicKey
+      Tags:
+        - Key: Name
+          Value: GIPQuotaAlerts
+        - Key: Purpose
+          Value: Quota monitoring notifications
+
+  # Service publishers need an explicit topic grant: the three alarms below
+  # (plus the metering and memory stack alarms that reuse this topic) publish
+  # as cloudwatch.amazonaws.com, and the model-lifecycle AWS Health rule as
+  # events.amazonaws.com. The monitor Lambdas publish with their execution
+  # roles and need no topic-policy statement.
+  QuotaAlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: CreateTopic
+    Properties:
+      Topics:
+        - !Ref QuotaAlertTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchAlarmsPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref QuotaAlertTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref QuotaAlertTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  # IAM Role for Quota Monitor Lambda
+  QuotaMonitorRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "CloudWatch GetMetricData/ListMetrics and CloudTrail LookupEvents require Resource: * by API design"
+      guard:
+        SuppressedRules:
+          # Single-purpose policy scoped to this role's tables/topic only -
+          # converting to a managed policy adds no security.
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: QuotaMonitorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt UserQuotaMetrics.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt QuotaPolicies.Arn
+                  - !Sub '${QuotaPolicies.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If [CreateTopic, !Ref QuotaAlertTopic, !Ref AlertTopicArn]
+              # The KMS grant for publishing to the encrypted created topic
+              # lives in QuotaMonitorKmsPolicy (conditional resource).
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+              # Metering reconciliation drift metrics (server vs client usage)
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'GIP/Quota'
+              # Failed async (EventBridge) invocations land in the DLQ
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt QuotaMonitorDLQ.Arn
+
+  # Publishing to the encrypted topic needs kms:GenerateDataKey + kms:Decrypt
+  # on its key (SNS Developer Guide, "Allow a user to send messages to a topic
+  # with SSE"). Separate conditional policies keep the grants absent when no
+  # relevant key exists and leave the role's inline statement list scanner-safe.
+  QuotaMonitorKmsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: CreateTopic
+    Properties:
+      Description: Lets the quota monitor Lambda publish to the KMS-encrypted quota alert topic
+      Roles:
+        - !Ref QuotaMonitorRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublishToEncryptedAlertTopic
+            Effect: Allow
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: !GetAtt QuotaAlertTopicKey.Arn
+
+  QuotaMonitorExternalKmsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: UsesExternalTopicKey
+    Properties:
+      Description: Lets the quota monitor Lambda publish to the external KMS-encrypted quota alert topic
+      Roles:
+        - !Ref QuotaMonitorRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublishToEncryptedAlertTopic
+            Effect: Allow
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: !Ref AlertTopicKmsKeyArn
+
+  # DLQ for failed async (EventBridge-scheduled) quota monitor invocations
+  QuotaMonitorDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: gip-quota-monitor-dlq
+      # AWS-managed SQS key: the Lambda service writes with the execution
+      # role, which the aws/sqs key policy already covers for this account.
+      KmsMasterKeyId: alias/aws/sqs
+      MessageRetentionPeriod: 1209600
+
+  # Lambda function for quota monitoring
+  QuotaMonitorFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Lambda invoked by EventBridge schedule, requires internet access for CloudWatch/DynamoDB/SNS — VPC adds complexity without security benefit"
+          - id: W92
+            reason: "Event-driven single invocation every 15 min — reserved concurrency unnecessary"
+    Properties:
+      FunctionName: gip-quota-monitor
+      Description: Monitors user token usage and sends alerts when quotas are exceeded
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt QuotaMonitorRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      DeadLetterConfig:
+        TargetArn: !GetAtt QuotaMonitorDLQ.Arn
+      Environment:
+        Variables:
+          QUOTA_TABLE: !Ref UserQuotaMetrics
+          POLICIES_TABLE: !Ref QuotaPolicies
+          SNS_TOPIC_ARN: !If [CreateTopic, !Ref QuotaAlertTopic, !Ref AlertTopicArn]
+          MONTHLY_TOKEN_LIMIT: !Ref MonthlyTokenLimit
+          WARNING_THRESHOLD_80: !Ref WarningThreshold80
+          WARNING_THRESHOLD_90: !Ref WarningThreshold90
+          DAILY_TOKEN_LIMIT: !Ref DailyTokenLimit
+          DAILY_ENFORCEMENT_MODE: !Ref DailyEnforcementMode
+          MONTHLY_ENFORCEMENT_MODE: !Ref MonthlyEnforcementMode
+          QUOTA_MODE: !Ref QuotaMode
+          MONTHLY_COST_LIMIT_USD: !Ref MonthlyCostLimitUsd
+          DAILY_COST_LIMIT_USD: !Ref DailyCostLimitUsd
+          ENABLE_FINEGRAINED_QUOTAS: !Ref EnableFinegrainedQuotas
+          METRICS_REGION: !Ref 'AWS::Region'
+      Code: ./lambda-functions/quota_monitor/
+
+  # EventBridge Rule to run quota monitor every 15 minutes
+  QuotaMonitorScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: gip-quota-monitor-schedule
+      Description: Trigger quota monitoring every 15 minutes
+      ScheduleExpression: rate(15 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt QuotaMonitorFunction.Arn
+          Id: QuotaMonitorTarget
+
+  # Permission for EventBridge to invoke the Lambda
+  QuotaMonitorSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref QuotaMonitorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt QuotaMonitorScheduleRule.Arn
+
+  # ============================================
+  # Sidecar Bypass Detection (detective control)
+  # Detects users invoking Bedrock without a running OTEL sidecar by joining
+  # CloudTrail Bedrock activity (tamper-proof) against OTEL-reported usage.
+  # ============================================
+
+  # IAM Role for Bypass Detection Lambda
+  SidecarMonitorRole:
+    Type: AWS::IAM::Role
+    Condition: BypassDetectionEnabled
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "CloudTrail LookupEvents and CloudWatch PutMetricData require Resource: * by API design (PutMetricData is namespace-conditioned)"
+      guard:
+        SuppressedRules:
+          # Single-purpose policy scoped to this role's table/topic only -
+          # converting to a managed policy adds no security.
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: BypassDetectionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Point reads on per-user records to check telemetry freshness
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                Resource:
+                  - !GetAtt UserQuotaMetrics.Arn
+              # Tamper-proof source of truth for who actually invoked Bedrock
+              - Effect: Allow
+                Action:
+                  - cloudtrail:LookupEvents
+                Resource: '*'
+              # Publish per-user sidecar health metrics
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'GIP/SidecarHealth'
+              # Alert administrators about stopped sidecars
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If [CreateTopic, !Ref QuotaAlertTopic, !Ref AlertTopicArn]
+              # The KMS grant for publishing to the encrypted created topic
+              # lives in SidecarMonitorKmsPolicy (conditional resource).
+              # Failed async (EventBridge) invocations land in the DLQ
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt SidecarMonitorDLQ.Arn
+
+  # Same encrypted-topic publisher grant as QuotaMonitorKmsPolicy, for the
+  # bypass-detection Lambda (both conditions: created topic AND detection on).
+  SidecarMonitorKmsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: BypassDetectionWithCreatedTopic
+    Properties:
+      Description: Lets the bypass-detection Lambda publish to the KMS-encrypted quota alert topic
+      Roles:
+        - !Ref SidecarMonitorRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublishToEncryptedAlertTopic
+            Effect: Allow
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: !GetAtt QuotaAlertTopicKey.Arn
+
+  SidecarMonitorExternalKmsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: BypassDetectionWithExternalTopicKey
+    Properties:
+      Description: Lets the bypass-detection Lambda publish to the external KMS-encrypted quota alert topic
+      Roles:
+        - !Ref SidecarMonitorRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublishToEncryptedAlertTopic
+            Effect: Allow
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: !Ref AlertTopicKmsKeyArn
+
+  # DLQ for failed async (EventBridge-scheduled) bypass detection invocations
+  SidecarMonitorDLQ:
+    Type: AWS::SQS::Queue
+    Condition: BypassDetectionEnabled
+    Properties:
+      QueueName: gip-bypass-detection-dlq
+      # AWS-managed SQS key: the Lambda service writes with the execution
+      # role, which the aws/sqs key policy already covers for this account.
+      KmsMasterKeyId: alias/aws/sqs
+      MessageRetentionPeriod: 1209600
+
+  # Lambda function for sidecar bypass detection
+  SidecarMonitorFunction:
+    Type: AWS::Lambda::Function
+    Condition: BypassDetectionEnabled
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Calls CloudTrail/DynamoDB/CloudWatch/SNS AWS APIs only, no VPC resources — VPC adds NAT cost for customers"
+          - id: W92
+            reason: "Event-driven single invocation every 15 min — reserved concurrency unnecessary"
+      guard:
+        SuppressedRules:
+          - LAMBDA_INSIDE_VPC
+          - LAMBDA_CONCURRENCY_CHECK
+    Properties:
+      FunctionName: gip-bypass-detection
+      Description: Detects users invoking Bedrock without a running OTEL sidecar (detective control)
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt SidecarMonitorRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      DeadLetterConfig:
+        TargetArn: !GetAtt SidecarMonitorDLQ.Arn
+      Environment:
+        Variables:
+          QUOTA_TABLE: !Ref UserQuotaMetrics
+          SNS_TOPIC_ARN: !If [CreateTopic, !Ref QuotaAlertTopic, !Ref AlertTopicArn]
+          METRICS_REGION: !Ref 'AWS::Region'
+          LOOKBACK_MINUTES: !Ref BypassDetectionLookbackMinutes
+          CLOUDWATCH_NAMESPACE: 'GIP/SidecarHealth'
+      Code: ./lambda-functions/sidecar_monitor/
+
+  # EventBridge Rule to run bypass detection every 15 minutes
+  SidecarMonitorScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: BypassDetectionEnabled
+    Properties:
+      Name: gip-bypass-detection-schedule
+      Description: Trigger sidecar bypass detection every 15 minutes
+      ScheduleExpression: rate(15 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SidecarMonitorFunction.Arn
+          Id: BypassDetectionTarget
+
+  # Permission for EventBridge to invoke the bypass detection Lambda
+  SidecarMonitorSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: BypassDetectionEnabled
+    Properties:
+      FunctionName: !Ref SidecarMonitorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SidecarMonitorScheduleRule.Arn
+
+  # ============================================
+  # End Sidecar Bypass Detection
+  # ============================================
+
+  # ============================================
+  # Quota Check API (Phase 2 - Access Blocking)
+  # ============================================
+
+  # IAM Role for Quota Check Lambda
+  QuotaCheckRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Single-purpose read-only policy scoped to the two quota tables -
+          # converting to a managed policy adds no security.
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: QuotaCheckPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt UserQuotaMetrics.Arn
+                  - !GetAtt QuotaPolicies.Arn
+                  - !Sub '${QuotaPolicies.Arn}/index/*'
+
+  # Lambda function for real-time quota checking
+  QuotaCheckFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Calls DynamoDB AWS APIs only, no VPC resources — VPC adds NAT cost for customers"
+          - id: W92
+            reason: "Synchronous credential-issuance auth path — reserved concurrency would throttle bursty logins"
+      guard:
+        SuppressedRules:
+          - LAMBDA_INSIDE_VPC
+          # Reserved concurrency would throttle the bursty credential-issuance
+          # auth path; account-level concurrency is the safety net.
+          - LAMBDA_CONCURRENCY_CHECK
+          # API Gateway invokes this function synchronously - a DLQ is never
+          # used on this invoke path.
+          - LAMBDA_DLQ_CHECK
+    Properties:
+      FunctionName: gip-quota-check
+      Description: Real-time quota check for credential issuance - blocks access when quota exceeded
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt QuotaCheckRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          QUOTA_TABLE: !Ref UserQuotaMetrics
+          POLICIES_TABLE: !Ref QuotaPolicies
+          MONTHLY_TOKEN_LIMIT: !Ref MonthlyTokenLimit
+          DAILY_TOKEN_LIMIT: !Ref DailyTokenLimit
+          DAILY_ENFORCEMENT_MODE: !Ref DailyEnforcementMode
+          MONTHLY_ENFORCEMENT_MODE: !Ref MonthlyEnforcementMode
+          QUOTA_MODE: !Ref QuotaMode
+          MONTHLY_COST_LIMIT_USD: !Ref MonthlyCostLimitUsd
+          DAILY_COST_LIMIT_USD: !Ref DailyCostLimitUsd
+          ENABLE_FINEGRAINED_QUOTAS: !Ref EnableFinegrainedQuotas
+          METERING_MODE: !Ref MeteringMode
+      Code: ./lambda-functions/quota_check/
+
+  # HTTP API Gateway (v2 - cheaper and faster than REST API)
+  QuotaCheckApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-quota-check-api'
+      Description: Real-time quota check API for Claude Code credential provider (JWT authenticated)
+      ProtocolType: HTTP
+      CorsConfiguration:
+        # CORS only matters to browsers; the quota API is called by the
+        # credential-process CLI binary. See the CorsAllowedOrigins parameter
+        # for how to effectively disable browser access.
+        AllowOrigins: !Ref CorsAllowedOrigins
+        AllowMethods:
+          - GET
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+        MaxAge: 300
+
+  # JWT Authorizer for OIDC token validation (only when SSO is enabled)
+  QuotaCheckAuthorizer:
+    Condition: HasJwtAuth
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref QuotaCheckApi
+      AuthorizerType: JWT
+      Name: oidc-jwt-authorizer
+      IdentitySource:
+        - "$request.header.Authorization"
+      JwtConfiguration:
+        Issuer: !Ref OidcIssuerUrl
+        Audience:
+          - !Ref OidcClientId
+
+  # Lambda integration for API Gateway
+  QuotaCheckIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref QuotaCheckApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt QuotaCheckFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  # Route for GET /check — single resource to avoid route-key conflict on
+  # in-place updates (two resources sharing the same RouteKey causes CFN 409).
+  # Uses !If to switch between JWT auth (OIDC) and IAM auth (IDC/none).
+  QuotaCheckRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref QuotaCheckApi
+      RouteKey: 'GET /check'
+      Target: !Sub 'integrations/${QuotaCheckIntegration}'
+      AuthorizerId: !If [HasJwtAuth, !Ref QuotaCheckAuthorizer, !Ref 'AWS::NoValue']
+      AuthorizationType: !If [HasJwtAuth, 'JWT', 'AWS_IAM']
+
+  # Default stage with auto-deploy
+  QuotaCheckStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref QuotaCheckApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 2000
+        ThrottlingRateLimit: 1000
+
+  QuotaCheckErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Quota checks are failing; fail-closed clients may be unable to refresh credentials
+      Namespace: GIP/Quota
+      MetricName: CheckFailures
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If [CreateTopic, !Ref QuotaAlertTopic, !Ref AlertTopicArn]
+
+  QuotaMonitorErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scheduled quota aggregation or alerting is failing
+      Namespace: GIP/Quota
+      MetricName: MonitorFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If [CreateTopic, !Ref QuotaAlertTopic, !Ref AlertTopicArn]
+
+  QuotaApi5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Quota API is returning server errors to credential clients
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref QuotaCheckApi
+        - Name: Stage
+          Value: '$default'
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If [CreateTopic, !Ref QuotaAlertTopic, !Ref AlertTopicArn]
+
+  # Permission for API Gateway to invoke Lambda
+  QuotaCheckLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref QuotaCheckFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${QuotaCheckApi}/*'
+
+  # ============================================
+  # End Quota Check API
+  # ============================================
+
+  # IAM Managed Policy granting execute-api:Invoke on the quota API.
+  # Required for IAM-auth callers (IDC permission sets, federated roles).
+  # The credential-process signs requests with SigV4, and API Gateway
+  # requires the caller to have this permission in their identity policy.
+  # Admins should attach this policy to their IDC permission set or IAM role.
+  QuotaApiInvokePolicy:
+    Condition: NoJwtAuth
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${AWS::StackName}-QuotaApiInvoke'
+      Description: 'Allows invoke on the quota check API Gateway (required for IAM-auth callers)'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowQuotaApiInvoke
+            Effect: Allow
+            Action: 'execute-api:Invoke'
+            Resource: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${QuotaCheckApi}/*'
+
+Outputs:
+  InferenceCellId:
+    Description: Account-local inference cell owning quota and enforcement state
+    Value: !Sub '${AWS::AccountId}:${AWS::Region}'
+
+  QuotaServiceName:
+    Description: Service-level attribution value applied to quota state
+    Value: quota-enforcement
+
+  QuotaTableName:
+    Description: Name of the UserQuotaMetrics DynamoDB table
+    Value: !Ref UserQuotaMetrics
+    Export:
+      Name: !Sub '${AWS::StackName}-QuotaTableName'
+
+  QuotaTableArn:
+    Description: ARN of the UserQuotaMetrics DynamoDB table
+    Value: !GetAtt UserQuotaMetrics.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-QuotaTableArn'
+
+  PoliciesTableName:
+    Description: Name of the QuotaPolicies DynamoDB table for fine-grained quotas
+    Value: !Ref QuotaPolicies
+    Export:
+      Name: !Sub '${AWS::StackName}-PoliciesTableName'
+
+  PoliciesTableArn:
+    Description: ARN of the QuotaPolicies DynamoDB table
+    Value: !GetAtt QuotaPolicies.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PoliciesTableArn'
+
+  QuotaAlertTopicArn:
+    Description: SNS Topic ARN for quota alerts - subscribe to this for notifications
+    Value: !If [CreateTopic, !Ref QuotaAlertTopic, !Ref AlertTopicArn]
+    Export:
+      Name: !Sub '${AWS::StackName}-QuotaAlertTopicArn'
+
+  QuotaAlertTopicKmsKeyArn:
+    Condition: HasEffectiveAlertTopicKmsKey
+    Description: >-
+      KMS key encrypting the effective quota alert topic. Stacks that reuse the
+      topic and publish from a Lambda need this key ARN to grant their execution role.
+    Value: !If [CreateTopic, !GetAtt QuotaAlertTopicKey.Arn, !Ref AlertTopicKmsKeyArn]
+    Export:
+      Name: !Sub '${AWS::StackName}-QuotaAlertTopicKmsKeyArn'
+
+  QuotaMonitorFunctionArn:
+    Description: ARN of the quota monitoring Lambda function
+    Value: !GetAtt QuotaMonitorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-QuotaMonitorFunctionArn'
+
+  QuotaCheckApiEndpoint:
+    Description: HTTP API endpoint for real-time quota checks - configure in credential provider
+    Value: !Sub 'https://${QuotaCheckApi}.execute-api.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-QuotaCheckApiEndpoint'
+
+  QuotaCheckFunctionArn:
+    Description: ARN of the quota check Lambda function
+    Value: !GetAtt QuotaCheckFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-QuotaCheckFunctionArn'
+
+  SidecarMonitorFunctionArn:
+    Condition: BypassDetectionEnabled
+    Description: ARN of the sidecar bypass-detection Lambda function
+    Value: !GetAtt SidecarMonitorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SidecarMonitorFunctionArn'
+
+  QuotaApiInvokePolicyArn:
+    Condition: NoJwtAuth
+    Description: >-
+      IAM Managed Policy ARN granting execute-api:Invoke on the quota API.
+      Attach this to your IDC permission set or IAM role used by Claude Code users.
+    Value: !Ref QuotaApiInvokePolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-QuotaApiInvokePolicyArn'

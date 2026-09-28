@@ -1,0 +1,61 @@
+# Pre-commit hooks for CloudFormation and YAML validation
+# Run `pre-commit install` to set up the git hook scripts
+# See https://pre-commit.com for more information
+
+repos:
+  # YAML syntax validation
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.33.0
+    hooks:
+      - id: yamllint
+        name: Validate YAML syntax
+        args: ['-d', 'relaxed']
+        files: \.(yaml|yml)$
+        exclude: ^(source/build/|source/dist/)
+
+  # CloudFormation template validation
+  - repo: https://github.com/aws-cloudformation/cfn-lint
+    rev: v0.83.8
+    hooks:
+      - id: cfn-lint
+        name: Validate CloudFormation templates
+        files: deployment/infrastructure/.*\.(yaml|yml)$
+        args: ['--ignore-checks', 'W3002']  # W3002 is for optional resource properties
+
+  # Custom AWS validation (requires AWS credentials)
+  - repo: local
+    hooks:
+      - id: validate-cfn-templates
+        name: Validate CloudFormation with AWS CLI
+        entry: scripts/validate-cloudformation.sh
+        language: script
+        files: deployment/infrastructure/.*\.(yaml|yml)$
+        pass_filenames: true
+        # This hook will only run if AWS credentials are configured
+        # It provides additional validation beyond cfn-lint
+
+  # Python code quality - Ruff (fast linter and formatter)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.1.9
+    hooks:
+      - id: ruff
+        name: Lint Python with Ruff (auto-fix)
+        args: [--fix, --exit-non-zero-on-fix]
+        files: ^source/.*\.py$
+        exclude: ^source/(build|dist)/
+
+      - id: ruff-format
+        name: Format Python with Ruff
+        files: ^source/.*\.py$
+        exclude: ^source/(build|dist)/
+
+  # Comprehensive smoke tests (catches import errors, syntax errors, and instantiation issues)
+  - repo: local
+    hooks:
+      - id: test-smoke
+        name: Run comprehensive smoke tests
+        entry: bash -c 'cd source && poetry run python -m pytest tests/test_smoke.py -q'
+        language: system
+        files: ^source/(governed_inference_platform/|credential_provider/).*\.py$
+        pass_filenames: false
+        # This test runs quickly (<1s) and catches critical errors before commit

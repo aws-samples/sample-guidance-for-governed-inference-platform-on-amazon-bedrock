@@ -1,0 +1,49 @@
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+LDFLAGS := -s -w -X gip-go/internal/version.Version=$(VERSION) -X gip-go/internal/version.Commit=$(COMMIT)
+# Windows: do NOT strip (-s -w). Defender cloud ML (Wacatac.B!ml) flags
+# stripped Go binaries and blocks them in subprocess/non-interactive contexts.
+# The .syso PE version-info files help but are not sufficient alone.
+LDFLAGS_WIN := -X gip-go/internal/version.Version=$(VERSION) -X gip-go/internal/version.Commit=$(COMMIT)
+OUT ?= bin
+
+.PHONY: all test clean fmt vet macos-arm64 macos-intel linux-x64 linux-arm64 windows
+
+all: macos-arm64 macos-intel linux-x64 linux-arm64 windows
+
+test:
+	go test ./... -v
+
+fmt:
+	go fmt ./...
+
+vet:
+	go vet ./...
+
+clean:
+	rm -rf $(OUT)
+
+macos-arm64:
+	@mkdir -p $(OUT)
+	CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(OUT)/credential-process-macos-arm64 ./cmd/credential-process/
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(OUT)/otel-helper-macos-arm64 ./cmd/otel-helper/
+
+macos-intel:
+	@mkdir -p $(OUT)
+	CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(OUT)/credential-process-macos-intel ./cmd/credential-process/
+	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(OUT)/otel-helper-macos-intel ./cmd/otel-helper/
+
+linux-x64:
+	@mkdir -p $(OUT)
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(OUT)/credential-process-linux-x64 ./cmd/credential-process/
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(OUT)/otel-helper-linux-x64 ./cmd/otel-helper/
+
+linux-arm64:
+	@mkdir -p $(OUT)
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(OUT)/credential-process-linux-arm64 ./cmd/credential-process/
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(OUT)/otel-helper-linux-arm64 ./cmd/otel-helper/
+
+windows:
+	@mkdir -p $(OUT)
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS_WIN)" -o $(OUT)/credential-process-windows.exe ./cmd/credential-process/
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS_WIN)" -o $(OUT)/otel-helper-windows.exe ./cmd/otel-helper/

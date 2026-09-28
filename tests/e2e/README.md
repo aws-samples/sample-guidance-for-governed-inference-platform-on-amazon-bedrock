@@ -1,0 +1,206 @@
+# E2E Test Harness
+
+Profile-driven end-to-end testing across authentication flows, operating systems, monitoring modes, config delivery mechanisms, and quota enforcement strategies.
+
+## Platform Focus
+
+Windows and macOS receive extra testing attention due to historical platform-specific issues:
+
+| Issue | Platform | Problem |
+|-------|----------|---------|
+| #427 | Windows | `install.bat` syntax errors (`& was unexpected`) |
+| #428 | Windows | CRLF line endings in generated `.sh` scripts |
+| #349 | macOS | Keychain integration failures |
+| #567 | Windows | `.cmd` fallback not invoking `.ps1` correctly |
+| #649 | Windows | DPAPI keyring retrieval taking 10-17s |
+| #664 | macOS | ARM64 binary detection / Rosetta fallback |
+
+Profiles 13-16 specifically target these platforms with stress scenarios (keyring chunking under load, sidecar monitoring, quota enforcement). The PR canary runs both Linux (profile 01) and Windows (profile 04) to catch regressions before merge.
+
+## How It Works
+
+Each test scenario is defined by a **profile JSON** file in `tests/e2e/profiles/`. A profile declares:
+
+- **Auth type**: OIDC (Cognito/Direct STS), IDC (device auth), or Passthrough (ambient creds)
+- **Platform**: linux-x64, windows-x64, macos-arm64
+- **Monitoring mode**: central (port 4318), sidecar (port 4319), or none
+- **Config delivery**: static (env vars) or bootstrap (API endpoint)
+- **Quota**: enabled/disabled, enforcement mode (block/alert), fine-grained policies
+- **Tests**: which test modules apply to this profile
+
+The test harness automatically skips test modules not declared in the active profile.
+
+## Running Locally
+
+### Prerequisites
+
+1. AWS credentials with access to deploy E2E stacks
+2. Python 3.11+ with test dependencies
+3. Built binaries for your platform
+
+### Setup
+
+```bash
+# Install dependencies
+pip install pytest pytest-timeout boto3 requests tenacity PyJWT
+
+# Build binaries (from source/go/)
+cd source/go
+go build -o dist/credential-process-linux-amd64 ./cmd/credential-process/
+go build -o dist/otel-helper-linux-amd64 ./cmd/otel-helper/
+cd ../..
+
+# Deploy E2E infrastructure (optional — needed for integration tests)
+cd deployment
+cdk deploy -c e2eMode=true gip-e2e-local-auth gip-e2e-local-monitoring gip-e2e-local-quota gip-e2e-local-config
+cd ..
+```
+
+### Run Tests
+
+```bash
+# Run a specific profile
+pytest tests/e2e/ --profile 01-oidc-cognito-linux-central -v
+
+# Run with environment variable
+E2E_PROFILE=09-passthrough-linux-none pytest tests/e2e/ -v
+
+# Skip slow tests (CloudWatch assertions)
+pytest tests/e2e/ --profile 01-oidc-cognito-linux-central -v -m "not slow"
+
+# Run only auth tests
+pytest tests/e2e/test_auth_flow.py --profile 01-oidc-cognito-linux-central -v
+```
+
+### Without AWS Infrastructure
+
+Tests skip gracefully when AWS credentials or stack outputs are unavailable:
+
+```bash
+# This will skip integration tests but validate test structure
+pytest tests/e2e/ --profile 09-passthrough-linux-none --co
+```
+
+## Adding a New Scenario
+
+1. Create a profile JSON in `tests/e2e/profiles/`:
+
+```json
+{
+  "name": "13-my-new-scenario",
+  "description": "Description of what this tests",
+  "auth": {"type": "oidc", "federation": "direct", "provider": "okta"},
+  "platform": "linux-x64",
+  "monitoring": {"mode": "central"},
+  "config_delivery": "static",
+  "quota": {"enabled": false},
+  "tests": ["auth_flow", "credential_output", "monitoring_pipeline"]
+}
+```
+
+2. Run it locally: `pytest tests/e2e/ --profile 13-my-new-scenario -v`.
+
+## Continuous integration
+
+The upstream project runs this harness in a GitHub Actions matrix that assumes an AWS
+role through GitHub OIDC. That workflow is not included in this sample; run the tests
+locally as shown above. If you add CI in your fork, scope the role's trust policy to your
+fork and a protected environment, and grant least privilege instead of PowerUserAccess.
+
+## Cost Estimate
+
+Running the full nightly matrix costs approximately **$0.50/month**:
+
+| Resource | Cost |
+|----------|------|
+| CloudFormation stacks (deployed ~20 min/night) | ~$0.10/month |
+| DynamoDB on-demand (test writes) | ~$0.01/month |
+| CloudWatch metrics/logs | ~$0.15/month |
+| GitHub Actions minutes (12 jobs × 10 min) | ~$0.24/month |
+| **Total** | **~$0.50/month** |
+
+## Profile Coverage Matrix
+
+| # | Profile | Auth | Platform | Monitoring | Delivery | Quota |
+|---|---------|------|----------|------------|----------|-------|
+| 01 | oidc-cognito-linux-central | OIDC/Cognito | Linux | Central | Static | — |
+| 02 | oidc-direct-linux-central-block | OIDC/Direct | Linux | Central | Static | Block |
+| 03 | oidc-direct-linux-bootstrap-alert | OIDC/Direct | Linux | Central | Bootstrap | Alert |
+| 04 | oidc-cognito-windows-central | OIDC/Cognito | Windows | Central | Static | — |
+| 05 | oidc-direct-windows-none | OIDC/Direct | Windows | None | Static | — |
+| 06 | oidc-direct-macos-sidecar-finegrained | OIDC/Direct | macOS | Sidecar | Static | Block+FG |
+| 07 | idc-linux-central-block | IDC | Linux | Central | Static | Block/SigV4 |
+| 08 | idc-windows-sidecar | IDC | Windows | Sidecar | Static | — |
+| 09 | passthrough-linux-none | Passthrough | Linux | None | Static | — |
+| 10 | oidc-direct-linux-bootstrap-finegrained | OIDC/Direct | Linux | Central | Bootstrap | Block+FG |
+| 11 | oidc-direct-linux-sidecar-block | OIDC/Direct | Linux | Sidecar | Static | Block |
+| 12 | oidc-cognito-macos-central-alert | OIDC/Cognito | macOS | Central | Static | Alert |
+| 13 | oidc-direct-windows-sidecar-alert | OIDC/Direct | Windows | Sidecar | Static | Alert |
+| 14 | oidc-cognito-windows-central-block | OIDC/Cognito | Windows | Central | Static | Block |
+| 15 | oidc-direct-macos-central-block | OIDC/Direct | macOS | Central | Static | Block |
+| 16 | idc-macos-sidecar | IDC | macOS | Sidecar | Static | — |
+
+### Dimensions Covered
+
+- **Auth types**: OIDC (Cognito federation, Direct STS), IDC (device auth), Passthrough
+- **IdP providers**: Cognito, Okta, Azure AD
+- **Platforms**: Linux x64, Windows x64, macOS ARM64
+- **Monitoring**: Central (port 4318), Sidecar (port 4319), None
+- **Config delivery**: Static (env vars), Bootstrap (API)
+- **Quota enforcement**: Block, Alert, Fine-grained (DynamoDB policies), SigV4 auth
+- **Quota auth**: API key, SigV4
+
+## Debugging Failures
+
+### Local Debugging
+
+```bash
+# Run with verbose output
+pytest tests/e2e/ --profile 01-oidc-cognito-linux-central -v -s --tb=long
+
+# Run single test
+pytest tests/e2e/test_auth_flow.py::TestAuthFlow::test_initial_auth_produces_valid_creds \
+  --profile 01-oidc-cognito-linux-central -v -s
+
+# Check what would run (collect only)
+pytest tests/e2e/ --profile 01-oidc-cognito-linux-central --co
+```
+
+### Common Issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| All tests skip | No `--profile` or `E2E_PROFILE` set | Set profile |
+| Binary not found | Wrong platform or build missing | Check `source/go/dist/` |
+| Stack outputs missing | Infrastructure not deployed | Deploy stacks or set `E2E_STACK_OUTPUTS` |
+| CloudWatch test timeout | Metric propagation delay | Increase retry timeout or mark as slow |
+| Port not listening | Proxy failed to start | Check binary stderr, system ports |
+
+## Test Markers
+
+- `@pytest.mark.e2e` — All E2E tests (use `-m e2e` to run only E2E)
+- `@pytest.mark.slow` — Tests with long waits (CloudWatch propagation)
+
+## File Structure
+
+```
+tests/e2e/
+├── conftest.py              # Shared fixtures, CLI args, skip logic
+├── helpers.py               # Shared utility functions (extracted from conftest)
+├── profiles/                # Profile JSON definitions
+│   ├── 01-oidc-cognito-linux-central.json
+│   ├── 02-oidc-direct-linux-central-block.json
+│   ├── ...
+│   ├── 13-oidc-direct-windows-sidecar-alert.json
+│   ├── 14-oidc-cognito-windows-central-block.json
+│   ├── 15-oidc-direct-macos-central-block.json
+│   └── 16-idc-macos-sidecar.json
+├── test_auth_flow.py        # Authentication tests
+├── test_credential_output.py # Output format tests
+├── test_monitoring_pipeline.py # OTLP proxy tests
+├── test_quota_enforcement.py # Quota tests
+├── test_config_delivery.py  # Bootstrap config tests
+├── test_binary_platform.py  # Platform-specific tests (Windows + macOS)
+├── artifacts/               # (gitignored) Stack outputs at runtime
+└── README.md                # This file
+```

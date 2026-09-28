@@ -1,0 +1,412 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Amazon Bedrock AgentCore Gateway with the managed Web Search connector for
+  Claude Cowork. Supports both OIDC (CUSTOM_JWT) and IAM Identity Center (IAM)
+  authorization modes via the AuthType parameter. Deploy into us-east-1 (the
+  only region where the Web Search connector is currently available).
+  DATA RESIDENCY: web search queries are processed in us-east-1 regardless of
+  where Bedrock inference or the IDE session runs. Organizations with data
+  residency or sovereignty obligations should evaluate whether user query data
+  transiting to this region is acceptable before enabling web search.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Authorization"
+        Parameters:
+          - AuthType
+          - DiscoveryUrl
+          - ClientId
+      - Label:
+          default: "Entitlements (OIDC only)"
+        Parameters:
+          - EntitledGroups
+          - PolicyMode
+          - PolicyValidationComplete
+      - Label:
+          default: "Web search"
+        Parameters:
+          - DomainExcludeList
+      - Label:
+          default: "Deployment posture"
+        Parameters:
+          - DeploymentMode
+    ParameterLabels:
+      AuthType:
+        default: "Authorization mode (oidc or idc)"
+      DiscoveryUrl:
+        default: "OIDC discovery URL (oidc only)"
+      ClientId:
+        default: "OIDC client ID (oidc only)"
+      EntitledGroups:
+        default: "Entitled IdP groups (optional)"
+      PolicyMode:
+        default: "Policy engine mode"
+      PolicyValidationComplete:
+        default: "Policy validation acknowledged"
+      DomainExcludeList:
+        default: "Excluded search domains (optional)"
+      DeploymentMode:
+        default: "Deployment posture (development or production)"
+  DataResidency:
+    Note: >-
+      Web search queries (or fragments of user prompts) are sent to the managed
+      Web Search connector in us-east-1, regardless of where the IDE session or
+      Bedrock inference runs. Review compliance impact for regulated workloads
+      (e.g. GDPR, data sovereignty) before enabling.
+
+Parameters:
+  AuthType:
+    Type: String
+    Default: oidc
+    AllowedValues:
+      - oidc
+      - idc
+    Description: >-
+      Authorization mode. Use 'oidc' for OIDC providers (Cognito, Okta, Entra,
+      Auth0, Google) — validates id_token via CUSTOM_JWT. Use 'idc' for IAM
+      Identity Center — authorizes via IAM credentials (SigV4).
+
+  DeploymentMode:
+    Type: String
+    Default: development
+    AllowedValues:
+      - development
+      - production
+    Description: >-
+      Deployment posture. For OIDC, production mode requires entitled groups,
+      ENFORCE policy mode, and an explicit acknowledgement that real JWT group
+      decisions were observed in LOG_ONLY first. IDC continues to use AWS_IAM;
+      caller IAM policy readiness remains external to this template.
+
+  DiscoveryUrl:
+    Type: String
+    Default: ''
+    Description: >-
+      OIDC discovery URL (required when AuthType=oidc, ignored for idc). The
+      gateway resolves .well-known/openid-configuration from this base URL.
+      Examples: https://cognito-idp.us-east-1.amazonaws.com/<pool-id>,
+      https://login.microsoftonline.com/<tenant>/v2.0,
+      https://<domain>.okta.com/oauth2/default
+
+  ClientId:
+    Type: String
+    Default: ''
+    Description: >-
+      OIDC client_id (required when AuthType=oidc, ignored for idc). The
+      gateway validates the id_token's 'aud' claim against this value.
+
+  DomainExcludeList:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >-
+      Optional. Domains to exclude from web search results (server-side
+      denylist). Leave empty for no filtering.
+
+  EntitledGroups:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$'
+    ConstraintDescription: >-
+      EntitledGroups is temporarily unavailable because AgentCore principal
+      group tags are strings and cannot be safely matched as group arrays.
+    Description: >-
+      Reserved for a redesigned OIDC group-entitlement policy. Must remain
+      empty: AgentCore exposes principal group tags as strings, and secure
+      exact membership matching is not currently available.
+
+  PolicyMode:
+    Type: String
+    Default: LOG_ONLY
+    AllowedValues:
+      - LOG_ONLY
+    Description: >-
+      Reserved policy-engine mode. Must remain LOG_ONLY while group
+      entitlements are unavailable; ENFORCE is rejected to prevent unsafe or
+      invalid authorization behavior.
+
+  PolicyValidationComplete:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      Operator acknowledgement for OIDC only. Set true only after real JWT group
+      claims produced expected Cedar decisions in LOG_ONLY. This parameter does
+      not itself prove live validation. Required for production OIDC mode.
+
+Rules:
+  ProductionOidcPolicyReadiness:
+    RuleCondition:
+      Fn::And:
+        - Fn::Equals:
+            - !Ref DeploymentMode
+            - production
+        - Fn::Equals:
+            - !Ref AuthType
+            - oidc
+    Assertions:
+      - Assert:
+          Fn::Equals:
+            - !Ref AuthType
+            - idc
+        AssertDescription: >-
+          Production OIDC mode is unavailable until secure exact group
+          entitlement matching is redesigned; use development OIDC or IDC.
+
+Conditions:
+  IsOIDC: !Equals [!Ref AuthType, 'oidc']
+  IsProduction: !Equals [!Ref DeploymentMode, production]
+  PolicyValidationAcknowledged: !Equals [!Ref PolicyValidationComplete, 'true']
+  HasDenylist: !Not [!Equals [!Join ['', !Ref DomainExcludeList], '']]
+  HasEntitledGroups: !Not [!Equals [!Ref EntitledGroups, '']]
+  # F-024: Cedar principals are built from JWT claims, so entitlement requires
+  # the CUSTOM_JWT (oidc) authorizer. IDC/SigV4 deployments are unaffected.
+  HasEntitlement: !And
+    - !Condition IsOIDC
+    - !Condition HasEntitledGroups
+
+Resources:
+  # IAM execution role assumed by the AgentCore service to operate the gateway
+  # and invoke the managed Web Search tool.
+  GatewayExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Single-purpose policy scoped to this role only - converting to a
+          # managed policy adds no security.
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-gateway-role'
+      Tags:
+        - Key: gip:service
+          Value: agentcore-web-search-gateway
+        - Key: gip:cell
+          Value: !Sub '${AWS::AccountId}:${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/${AWS::StackName}-gw-*'
+      Policies:
+        - PolicyName: websearch-gateway
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: GetGateway
+                Effect: Allow
+                Action: bedrock-agentcore:GetGateway
+                Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/${AWS::StackName}-gw-*'
+              - Sid: GetConfigurationBundleVersion
+                Effect: Allow
+                Action: bedrock-agentcore:GetConfigurationBundleVersion
+                Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:configuration-bundle/*'
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref 'AWS::AccountId'
+                    aws:RequestedRegion: !Ref 'AWS::Region'
+              - Sid: InvokeWebSearch
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeWebSearch
+                Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:aws:tool/web-search.v1'
+              - Sid: InvokeGateway
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeGateway
+                Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/${AWS::StackName}-gw-*'
+              # F-023: Gateway creation validates policy-engine access before
+              # the entitlement policy can be attached.
+              - !If
+                - HasEntitlement
+                - Sid: GetPolicyEngine
+                  Effect: Allow
+                  Action:
+                    - bedrock-agentcore:GetPolicyEngine
+                    - bedrock-agentcore:AuthorizeAction
+                    - bedrock-agentcore:PartiallyAuthorizeActions
+                  Resource: !Ref GatewayPolicyEngine
+                - !Ref AWS::NoValue
+              - !If
+                - HasEntitlement
+                - Sid: AuthorizeGatewayAction
+                  Effect: Allow
+                  Action:
+                    - bedrock-agentcore:AuthorizeAction
+                    - bedrock-agentcore:PartiallyAuthorizeActions
+                  Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/${AWS::StackName}-gw-*'
+                - !Ref AWS::NoValue
+
+  WebSearchGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: !Sub '${AWS::StackName}-gw'
+      Description: Claude Cowork web search gateway (managed Web Search connector)
+      RoleArn: !GetAtt GatewayExecutionRole.Arn
+      ProtocolType: MCP
+      ProtocolConfiguration:
+        Mcp:
+          SupportedVersions:
+            - '2025-03-26'
+      # OIDC deployments use CUSTOM_JWT (validates id_token aud claim).
+      # IDC deployments use AWS_IAM (validates caller's SigV4 credentials).
+      AuthorizerType: !If [IsOIDC, CUSTOM_JWT, AWS_IAM]
+      AuthorizerConfiguration: !If
+        - IsOIDC
+        - CustomJWTAuthorizer:
+            DiscoveryUrl: !Ref DiscoveryUrl
+            # AllowedAudience validates the id_token's 'aud' claim, which every
+            # OIDC provider sets to client_id. Works uniformly across Cognito,
+            # Okta, Auth0, Entra ID, and Google.
+            AllowedAudience:
+              - !Ref ClientId
+        - !Ref 'AWS::NoValue'
+      # F-024: Reserved for the group-entitlement redesign. EntitledGroups is
+      # parameter-validated to empty, so this cannot attach by default.
+      PolicyEngineConfiguration: !If
+        - HasEntitlement
+        - Arn: !Ref GatewayPolicyEngine
+          Mode: !Ref PolicyMode
+        - !Ref 'AWS::NoValue'
+      Tags:
+        'gip:service': agentcore-web-search-gateway
+        'gip:cell': !Sub '${AWS::AccountId}:${AWS::Region}'
+
+  # F-024: Dormant policy-engine shape retained for the future redesign.
+  # EntitledGroups currently rejects every non-empty value before resources
+  # are created, preventing the invalid String-tag containsAny policy from
+  # causing a late opaque AgentCore failure.
+  GatewayPolicyEngine:
+    Type: AWS::BedrockAgentCore::PolicyEngine
+    Condition: HasEntitlement
+    Properties:
+      # Name pattern ^[A-Za-z][A-Za-z0-9_]*$ forbids hyphens (max 48 chars) —
+      # convert the stack name's hyphens to underscores.
+      Name: !Join ['_', !Split ['-', !Ref 'AWS::StackName']]
+      Description: >-
+        Reserved Cedar entitlement engine for the web search gateway. Group
+        entitlement deployment is currently blocked during parameter validation.
+      Tags:
+        - Key: gip:service
+          Value: agentcore-web-search-gateway
+        - Key: gip:cell
+          Value: !Sub '${AWS::AccountId}:${AWS::Region}'
+
+  GatewayEntitlementPolicy:
+    Type: AWS::BedrockAgentCore::Policy
+    Condition: HasEntitlement
+    Properties:
+      PolicyEngineId: !GetAtt GatewayPolicyEngine.PolicyEngineId
+      Name: !Join ['', [!Join ['_', !Split ['-', !Ref 'AWS::StackName']], '_entitlement']]
+      Description: >-
+        Reserved policy for a future exact group-membership design. Current
+        template validation prevents this resource from being created.
+      # The engine-level PolicyMode (LOG_ONLY | ENFORCE) on the Gateway is the
+      # single staging switch; the policy itself always contributes (ACTIVE).
+      EnforcementMode: ACTIVE
+      # AgentCore currently binds group claims as String principal tags, not
+      # arrays. This legacy statement is unreachable until it is redesigned.
+      ValidationMode: !If [IsProduction, FAIL_ON_ANY_FINDINGS, IGNORE_ALL_FINDINGS]
+      Definition:
+        Cedar:
+          Statement: |
+            forbid(principal, action, resource);
+
+  WebSearchTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    # The managed "Connector" target type (web-search) is newer than the schema
+    # bundled with current cfn-lint, which still expects the legacy
+    # Http/Lambda/OpenApiSchema/etc. shapes and flags Connector/Mcp and an
+    # optional Name as invalid. These are false positives; the configuration is
+    # validated against a live in-account gateway. Suppress the affected checks
+    # locally until the cfn-lint resource spec catches up.
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3002
+            - E3003
+            - E3018
+    Properties:
+      GatewayIdentifier: !GetAtt WebSearchGateway.GatewayIdentifier
+      Name: !Sub '${AWS::StackName}-websearch'
+      Description: Managed Web Search connector tool
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      TargetConfiguration:
+        Mcp:
+          Connector:
+            Source:
+              ConnectorId: web-search
+            Configurations:
+              # ParameterValues must always be present — the service rejects a
+              # config entry without it. Empty {} = no domain filter.
+              - Name: WebSearch
+                ParameterValues: !If
+                  - HasDenylist
+                  - domainFilter:
+                      exclude: !Ref DomainExcludeList
+                  - {}
+
+Outputs:
+  GatewayMcpEndpoint:
+    Description: >-
+      MCP endpoint URL of the gateway. The CloudFormation GatewayUrl attribute
+      already includes the /mcp suffix; consumers should use it as-is.
+    Value: !GetAtt WebSearchGateway.GatewayUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-GatewayUrl'
+
+  GatewayArn:
+    Description: ARN of the AgentCore gateway.
+    Value: !GetAtt WebSearchGateway.GatewayArn
+
+  GatewayId:
+    Description: Identifier of the AgentCore gateway.
+    Value: !GetAtt WebSearchGateway.GatewayIdentifier
+
+  GatewayExecutionRoleArn:
+    Description: ARN of the gateway execution IAM role.
+    Value: !GetAtt GatewayExecutionRole.Arn
+
+  AuthorizerType:
+    Description: >-
+      The authorizer type configured for this gateway (CUSTOM_JWT or IAM).
+    Value: !If [IsOIDC, CUSTOM_JWT, AWS_IAM]
+
+  GatewayServiceName:
+    Description: Service-level attribution value applied to the AgentCore gateway
+    Value: agentcore-web-search-gateway
+
+  InferenceCellId:
+    Description: Account and Region containing gateway resources and service telemetry
+    Value: !Sub '${AWS::AccountId}:${AWS::Region}'
+
+  DeploymentModeValue:
+    Description: Selected deployment posture; production OIDC is validated by template Rules
+    Value: !Ref DeploymentMode
+
+  EntitlementPolicyStatus:
+    Description: >-
+      OIDC entitlement state, or IAM authorization for IDC. IAM caller policy
+      scope is external and is not claimed as validated here.
+    Value: !If [HasEntitlement, !Ref PolicyMode, !If [IsOIDC, NOT_CONFIGURED, IAM_AUTHORIZATION]]
+
+  PolicyValidationStatus:
+    Description: Operator acknowledgement state; not proof of a live validation run
+    Value: !If [IsOIDC, !If [PolicyValidationAcknowledged, ACKNOWLEDGED, NOT_ACKNOWLEDGED], NOT_APPLICABLE_IAM]
+
+  ProductionReadiness:
+    Description: Static template readiness only; external IAM policies and live traffic still require validation
+    Value: !If
+      - IsProduction
+      - !If [IsOIDC, PRODUCTION_OIDC_STATIC_GATES_SATISFIED, PRODUCTION_IAM_EXTERNAL_POLICY_REVIEW_REQUIRED]
+      - DEVELOPMENT_DEFAULTS

@@ -1,0 +1,388 @@
+# ABOUTME: Unit tests for Profile model and configuration management
+# ABOUTME: Tests cross-region profile field handling and migration logic
+
+"""Tests for the Profile model and Config manager."""
+
+import json
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+from governed_inference_platform.config import Config, Profile
+
+
+class TestProfileModel:
+    """Tests for the Profile dataclass."""
+
+    def test_cross_region_profile_field_exists(self):
+        """Test that cross_region_profile field is available in Profile."""
+        profile = Profile(
+            name="test",
+            provider_domain="test.okta.com",
+            client_id="test-client",
+            credential_storage="session",
+            aws_region="us-east-1",
+            identity_pool_name="test-pool",
+            cross_region_profile="us",
+        )
+
+        assert profile.cross_region_profile == "us"
+        assert "cross_region_profile" in profile.to_dict()
+
+    def test_cross_region_profile_optional(self):
+        """Test that cross_region_profile is optional and defaults to None."""
+        profile = Profile(
+            name="test",
+            provider_domain="test.okta.com",
+            client_id="test-client",
+            credential_storage="session",
+            aws_region="us-east-1",
+            identity_pool_name="test-pool",
+        )
+
+        assert profile.cross_region_profile is None
+
+    def test_from_dict_with_cross_region(self):
+        """Test Profile.from_dict handles cross_region_profile field."""
+        data = {
+            "name": "test",
+            "provider_domain": "test.okta.com",
+            "client_id": "test-client",
+            "credential_storage": "session",
+            "aws_region": "us-east-1",
+            "identity_pool_name": "test-pool",
+            "allowed_bedrock_regions": ["us-east-1", "us-east-2", "us-west-2"],
+            "cross_region_profile": "us",
+            "monitoring_enabled": True,
+            "analytics_enabled": True,
+        }
+
+        profile = Profile.from_dict(data)
+
+        assert profile.cross_region_profile == "us"
+        assert profile.allowed_bedrock_regions == ["us-east-1", "us-east-2", "us-west-2"]
+
+    def test_migration_us_regions_to_cross_region_profile(self):
+        """Test that existing US regions configs get 'us' cross-region profile."""
+        # Legacy config without cross_region_profile but with US regions
+        data = {
+            "name": "legacy",
+            "provider_domain": "test.okta.com",
+            "client_id": "test-client",
+            "credential_storage": "session",
+            "aws_region": "us-east-1",
+            "identity_pool_name": "test-pool",
+            "allowed_bedrock_regions": ["us-west-2", "us-east-1"],
+            "monitoring_enabled": False,
+        }
+
+        profile = Profile.from_dict(data)
+
+        # Should auto-detect US profile
+        assert profile.cross_region_profile == "us"
+
+    def test_migration_non_us_regions_no_profile(self):
+        """Test that non-US regions don't get auto-assigned a profile."""
+        data = {
+            "name": "eu-config",
+            "provider_domain": "test.okta.com",
+            "client_id": "test-client",
+            "credential_storage": "session",
+            "aws_region": "eu-west-1",
+            "identity_pool_name": "test-pool",
+            "allowed_bedrock_regions": ["eu-west-1", "eu-central-1"],
+            "monitoring_enabled": False,
+        }
+
+        profile = Profile.from_dict(data)
+
+        # Should not auto-assign profile for non-US regions
+        assert profile.cross_region_profile is None
+
+    def test_to_dict_includes_cross_region_profile(self):
+        """Test that to_dict includes cross_region_profile."""
+        profile = Profile(
+            name="test",
+            provider_domain="test.okta.com",
+            client_id="test-client",
+            credential_storage="session",
+            aws_region="us-east-1",
+            identity_pool_name="test-pool",
+            cross_region_profile="us",
+            allowed_bedrock_regions=["us-east-1", "us-east-2", "us-west-2"],
+        )
+
+        result = profile.to_dict()
+
+        assert result["cross_region_profile"] == "us"
+        assert result["allowed_bedrock_regions"] == ["us-east-1", "us-east-2", "us-west-2"]
+
+    def test_to_dict_excludes_client_secret(self):
+        """OAuth client secrets must not be persisted in profile JSON."""
+        profile = Profile(  # nosec B106 -- dummy client secret fixture, not a real credential
+            name="test",
+            provider_domain="test.okta.com",
+            client_id="test-client",
+            credential_storage="session",
+            aws_region="us-east-1",
+            identity_pool_name="test-pool",
+            client_secret="do-not-write-me",
+        )
+
+        assert "client_secret" not in profile.to_dict()
+
+
+class TestCodebuildRegionField:
+    """Tests for the codebuild_region field (cross-region CodeBuild override)."""
+
+    def test_codebuild_region_defaults_to_none(self):
+        """codebuild_region is optional and defaults to None."""
+        profile = Profile(
+            name="test",
+            provider_domain="test.okta.com",
+            client_id="test-client",
+            credential_storage="session",
+            aws_region="us-east-1",
+            identity_pool_name="test-pool",
+        )
+
+        assert profile.codebuild_region is None
+
+    def test_from_dict_keeps_codebuild_region(self):
+        """from_dict must NOT drop codebuild_region.
+
+        Regression: before this field existed on the dataclass, from_dict's
+        field-filter silently discarded the key, so the cross-region override
+        could never be loaded. This test fails against that prior behavior.
+        """
+        data = {
+            "name": "test",
+            "provider_domain": "test.okta.com",
+            "client_id": "test-client",
+            "credential_storage": "session",
+            "aws_region": "ap-southeast-1",
+            "identity_pool_name": "test-pool",
+            "enable_codebuild": True,
+            "codebuild_region": "ap-southeast-2",
+        }
+
+        profile = Profile.from_dict(data)
+
+        assert profile.codebuild_region == "ap-southeast-2"
+
+    def test_codebuild_region_round_trips(self):
+        """codebuild_region survives a to_dict -> from_dict round-trip."""
+        profile = Profile(
+            name="test",
+            provider_domain="test.okta.com",
+            client_id="test-client",
+            credential_storage="session",
+            aws_region="ap-southeast-1",
+            identity_pool_name="test-pool",
+            enable_codebuild=True,
+            codebuild_region="ap-southeast-2",
+        )
+
+        restored = Profile.from_dict(profile.to_dict())
+
+        assert "codebuild_region" in profile.to_dict()
+        assert restored.codebuild_region == "ap-southeast-2"
+
+    def test_legacy_config_without_codebuild_region_loads(self):
+        """Old configs without codebuild_region load and default to None (backward compat)."""
+        data = {
+            "name": "legacy",
+            "provider_domain": "test.okta.com",
+            "client_id": "test-client",
+            "credential_storage": "session",
+            "aws_region": "us-west-2",
+            "identity_pool_name": "test-pool",
+            "enable_codebuild": True,
+        }
+
+        profile = Profile.from_dict(data)
+
+        assert profile.codebuild_region is None
+
+    def test_codebuild_prior_regions_default_empty(self):
+        """codebuild_prior_regions defaults to an empty list (backward compat)."""
+        profile = Profile.from_dict(
+            {
+                "name": "t",
+                "provider_domain": "test.okta.com",
+                "client_id": "x",
+                "credential_storage": "session",
+                "aws_region": "us-west-2",
+                "identity_pool_name": "tp",
+            }
+        )
+        assert profile.codebuild_prior_regions == []
+
+    def test_codebuild_prior_regions_round_trip(self):
+        """codebuild_prior_regions survives from_dict -> to_dict (so destroy can read it)."""
+        profile = Profile.from_dict(
+            {
+                "name": "t",
+                "provider_domain": "test.okta.com",
+                "client_id": "x",
+                "credential_storage": "session",
+                "aws_region": "ap-southeast-1",
+                "identity_pool_name": "tp",
+                "enable_codebuild": True,
+                "codebuild_region": "us-east-1",
+                "codebuild_prior_regions": ["ap-southeast-2", "eu-west-1"],
+            }
+        )
+        assert profile.codebuild_prior_regions == ["ap-southeast-2", "eu-west-1"]
+        restored = Profile.from_dict(profile.to_dict())
+        assert restored.codebuild_prior_regions == ["ap-southeast-2", "eu-west-1"]
+
+    def test_nested_guardrails_profile_shape_is_migrated(self):
+        profile = Profile.from_dict(
+            {
+                "name": "t",
+                "provider_domain": "test.okta.com",
+                "client_id": "x",
+                "credential_storage": "session",
+                "aws_region": "us-east-1",
+                "identity_pool_name": "tp",
+                "guardrails": {
+                    "enabled": True,
+                    "name": "team-guardrail",
+                    "content_filter_strength": "HIGH",
+                    "model_include_list": ["anthropic.claude-haiku-4-5"],
+                    "kms_key_arn": "arn:aws:kms:us-east-1:123456789012:key/abc",
+                },
+            }
+        )
+
+        assert profile.guardrails_enabled is True
+        assert profile.guardrails_name == "team-guardrail"
+        assert profile.guardrails_content_filter_strength == "HIGH"
+        assert profile.guardrails_model_include_list == ["anthropic.claude-haiku-4-5"]
+        assert profile.guardrails_kms_key_arn == "arn:aws:kms:us-east-1:123456789012:key/abc"
+
+
+class TestExtraFilesField:
+    """Tests for the admin-only extra_files field."""
+
+    def test_defaults_to_empty_list(self):
+        """New field defaults to [] so old profiles load unchanged."""
+        profile = Profile(
+            name="t",
+            provider_domain="test.okta.com",
+            client_id="x",
+            credential_storage="session",
+            aws_region="us-east-1",
+            identity_pool_name="tp",
+        )
+        assert profile.extra_files == []
+        assert "extra_files" in profile.to_dict()
+
+    def test_legacy_config_without_extra_files_loads(self):
+        """A profile.json saved before this field existed loads with []."""
+        profile = Profile.from_dict(
+            {
+                "name": "t",
+                "provider_domain": "test.okta.com",
+                "client_id": "x",
+                "credential_storage": "session",
+                "aws_region": "us-east-1",
+                "identity_pool_name": "tp",
+            }
+        )
+        assert profile.extra_files == []
+
+    def test_round_trip_preserves_entries(self):
+        """extra_files survives a to_dict -> from_dict round-trip."""
+        entries = [
+            {"name": "certs", "targets": "all", "from": "~/secure/certs"},
+            {"name": "preinstall-mac.sh", "targets": ["macos"], "from": "~/x/pre.sh"},
+        ]
+        profile = Profile(
+            name="t",
+            provider_domain="test.okta.com",
+            client_id="x",
+            credential_storage="session",
+            aws_region="us-east-1",
+            identity_pool_name="tp",
+            extra_files=entries,
+        )
+        restored = Profile.from_dict(profile.to_dict())
+        assert restored.extra_files == entries
+
+
+class TestConfigManager:
+    """Tests for the Config manager."""
+
+    def test_save_and_load_with_cross_region_profile(self):
+        """Test that Config properly saves and loads cross_region_profile."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Mock the config directory
+            config_file = Path(tmpdir) / "config.json"
+
+            with patch.object(Config, "CONFIG_FILE", config_file):
+                with patch.object(Config, "CONFIG_DIR", Path(tmpdir)):
+                    # Create and save config
+                    config = Config()
+                    profile = Profile(
+                        name="test",
+                        provider_domain="test.okta.com",
+                        client_id="test-client",
+                        credential_storage="keyring",
+                        aws_region="us-west-2",
+                        identity_pool_name="test-pool",
+                        cross_region_profile="us",
+                        allowed_bedrock_regions=["us-east-1", "us-east-2", "us-west-2"],
+                    )
+                    config.add_profile(profile)
+                    config.save()
+
+                    # Load and verify
+                    loaded_config = Config.load()
+                    loaded_profile = loaded_config.get_profile("test")
+
+                    assert loaded_profile is not None
+                    assert loaded_profile.cross_region_profile == "us"
+                    assert loaded_profile.allowed_bedrock_regions == ["us-east-1", "us-east-2", "us-west-2"]
+
+    def test_backward_compatibility_load(self):
+        """Test loading old config files without cross_region_profile."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = Path(tmpdir) / "config.json"
+            profiles_dir = Path(tmpdir) / "profiles"
+            profiles_dir.mkdir()
+
+            # Write new-style config
+            config_data = {"schema_version": "2.0", "active_profile": "default", "profiles_dir": str(profiles_dir)}
+
+            with open(config_file, "w", encoding="utf-8") as f:
+                json.dump(config_data, f)
+
+            # Write profile without cross_region_profile (backward compatibility test)
+            profile_data = {
+                "name": "default",
+                "provider_domain": "test.okta.com",
+                "client_id": "test-client",
+                "credential_storage": "session",
+                "aws_region": "us-east-1",
+                "identity_pool_name": "test-pool",
+                "allowed_bedrock_regions": ["us-east-1", "us-west-2"],
+                "monitoring_enabled": True,
+                "analytics_enabled": False,
+                "created_at": "2024-01-01T00:00:00",
+                "updated_at": "2024-01-01T00:00:00",
+            }
+
+            with open(profiles_dir / "default.json", "w", encoding="utf-8") as f:
+                json.dump(profile_data, f)
+
+            with patch.object(Config, "CONFIG_FILE", config_file):
+                with patch.object(Config, "CONFIG_DIR", Path(tmpdir)):
+                    with patch.object(Config, "PROFILES_DIR", profiles_dir):
+                        loaded_config = Config.load()
+                        profile = loaded_config.get_profile()
+
+                        assert profile is not None
+                        # Should auto-detect US profile from regions
+                        assert profile.cross_region_profile == "us"

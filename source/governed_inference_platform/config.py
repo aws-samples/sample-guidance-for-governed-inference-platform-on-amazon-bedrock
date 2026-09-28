@@ -1,0 +1,715 @@
+# ABOUTME: Configuration management for the Governed Inference Platform
+# ABOUTME: Handles profiles, settings persistence, and configuration validation
+
+"""Configuration management for the Governed Inference Platform."""
+
+import json
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+# AWS regions where the Amazon Bedrock AgentCore managed Web Search connector
+# is available. Extend this list as regional availability expands.
+WEBSEARCH_SUPPORTED_REGIONS = ["us-east-1"]
+
+# IAM user guide for obtaining an OIDC provider certificate thumbprint. Referenced by
+# the `gip init` prompt, the answers-file validator and the console wizard help text.
+IAM_OIDC_THUMBPRINT_GUIDE_URL = (
+    "https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_create_oidc_verify-thumbprint.html"
+)
+
+
+@dataclass
+class Profile:
+    """Configuration profile for a deployment."""
+
+    name: str
+    provider_domain: str  # Generic OIDC provider domain (was okta_domain)
+    client_id: str  # Generic OIDC client ID (was okta_client_id)
+    credential_storage: str  # Storage method: "keyring" (OS keyring) or "session" (~/.aws/credentials)
+    aws_region: str
+    identity_pool_name: str
+    schema_version: str = "2.0"  # Configuration schema version
+    stack_names: dict[str, str] = field(default_factory=dict)
+    monitoring_enabled: bool = True
+    monitoring_mode: str = "central"  # "sidecar" (local collector) or "central" (ECS Fargate)
+    monitoring_config: dict[str, Any] = field(default_factory=dict)
+    analytics_enabled: bool = True  # Analytics pipeline for user metrics
+    metrics_log_group: str = "/aws/gip/metrics"
+    data_retention_days: int = 90
+    firehose_buffer_interval: int = 900
+    analytics_debug_mode: bool = False
+    allowed_bedrock_regions: list[str] = field(default_factory=list)
+    cross_region_profile: str | None = None  # Cross-region profile: "us", "europe", "apac"
+    selected_model: str | None = None  # Selected Claude model ID (e.g., "us.anthropic.claude-3-7-sonnet-20250805-v1:0")
+    model_alias: str | None = None  # Claude Code alias for ANTHROPIC_MODEL: "sonnet", "opus", "opusplan", "haiku"
+    lock_default_model: bool = (
+        False  # Write ANTHROPIC_MODEL + DEFAULT_*_MODEL into managed-settings (locks users to admin's choice)
+    )
+    selected_source_region: str | None = None  # User-selected source region for AWS config and Claude Code settings
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    provider_type: str | None = None  # Auto-detected: "okta", "auth0", "azure", "cognito", "google", "generic"
+    cognito_user_pool_id: str | None = None  # Only for Cognito User Pool providers
+    okta_auth_server: str = (
+        ""  # Okta authorization server ID ("default" for dev/free plans, empty for Org server on paid plans)
+    )
+
+    # Generic OIDC provider configuration (provider_type == "generic")
+    # Required when the IdP isn't Okta/Auth0/Azure/Cognito (e.g. PingFederate, Keycloak, ForgeRock).
+    # When set, these override the hardcoded paths in PROVIDER_CONFIGS.
+    oidc_issuer_url: str | None = None  # e.g. https://auth.example.com (no trailing slash)
+    oidc_authorization_endpoint: str | None = None  # Full URL or path appended to issuer
+    oidc_token_endpoint: str | None = None  # Full URL or path appended to issuer
+    oidc_jwks_uri: str | None = None  # Full URL to JWKS endpoint
+    # Optional override for AWS::IAM::OIDCProvider.ThumbprintList (40 hex chars, comma-separated
+    # for several). Leave unset: IAM retrieves the CA thumbprint itself. Set only when the JWKS
+    # host cert is signed by a private CA (see IAM_OIDC_THUMBPRINT_GUIDE_URL). Older profiles
+    # that carry a value keep deploying it unchanged.
+    oidc_thumbprint: str | None = None
+    oidc_prompt: str | None = None  # OIDC prompt param for Azure auth (default "select_account", "" to skip)
+    enable_codebuild: bool = False  # Enable CodeBuild for Windows binary builds
+    codebuild_region: str | None = None  # Region for CodeBuild stack/builds; falls back to aws_region when unset
+    codebuild_prior_regions: list[str] = field(
+        default_factory=list
+    )  # Regions a CodeBuild stack was previously deployed to (so destroy can clean orphans after a region change)
+    enable_distribution: bool = False  # Enable package distribution features (legacy, use distribution_type)
+
+    # Distribution platform configuration
+    distribution_type: str | None = None  # "presigned-s3" | "landing-page" | None (disabled)
+    distribution_idp_provider: str | None = None  # okta|azure|auth0|cognito|generic (landing-page only)
+    distribution_idp_domain: str | None = None  # IdP domain for web auth (e.g., "company.okta.com")
+    distribution_idp_client_id: str | None = None  # Web application client ID
+    distribution_idp_client_secret_arn: str | None = None  # Secrets Manager ARN for client secret
+    distribution_custom_domain: str | None = None  # Optional custom domain (e.g., "downloads.company.com")
+    distribution_hosted_zone_id: str | None = None  # Optional Route53 hosted zone ID
+    # Presigning principal for presigned-s3 distribution (admin-side, not packaged):
+    # "iam-user" (default) = static access key in Secrets Manager, URLs up to 7 days.
+    # "role" = assumable IAM role, no static credentials, URLs capped at 12 hours
+    # (presigned URLs signed with temporary credentials die with the session).
+    distribution_presign_principal_type: str = "iam-user"
+
+    # Generic OIDC distribution config (distribution_idp_provider == "generic").
+    # Required when the landing-page IdP isn't Okta/Azure/Auth0/Cognito (e.g. PingFederate,
+    # Keycloak, ForgeRock). Unlike those providers, ALB authenticate-oidc endpoints cannot be
+    # derived from a single domain, so each must be supplied explicitly. The ALB runs the OAuth
+    # authorization-code flow (not JWT signature validation), so no JWKS/thumbprint is needed here.
+    distribution_idp_issuer: str | None = None  # OIDC issuer URL (must match the 'iss' claim)
+    distribution_idp_authorization_endpoint: str | None = None  # Full authorization endpoint URL
+    distribution_idp_token_endpoint: str | None = None  # Full token endpoint URL
+    distribution_idp_userinfo_endpoint: str | None = None  # Full userinfo endpoint URL
+
+    # Quota monitoring configuration
+    quota_monitoring_enabled: bool = False  # Enable per-user token quota monitoring
+    quota_limit_type: str = "token"  # "token" (raw token counts) or "cost" (USD budgets)
+    monthly_cost_limit: float = 0  # Monthly USD budget per user (cost mode, 0 = disabled)
+    daily_cost_limit: float = 0  # Daily USD budget per user (cost mode, 0 = disabled)
+    monthly_token_limit: int = 225000000  # Monthly token limit per user (225M default)
+    warning_threshold_80: int = 180000000  # Warning threshold at 80% (180M default)
+    warning_threshold_90: int = 202500000  # Critical threshold at 90% (202.5M default)
+    daily_token_limit: int | None = None  # Daily token limit (auto-calculated from monthly)
+    burst_buffer_percent: int = 10  # Burst buffer for daily limit (5-25%, default 10%)
+    daily_enforcement_mode: str = "alert"  # Daily limit enforcement: "alert" or "block"
+    monthly_enforcement_mode: str = "block"  # Monthly limit enforcement: "alert" or "block"
+    enable_finegrained_quotas: bool = False  # Enable fine-grained quota policies (user/group/default)
+    quota_policies_table: str | None = None  # DynamoDB table name for quota policies
+    user_quota_metrics_table: str | None = None  # DynamoDB table name for user quota metrics
+    quota_api_endpoint: str | None = None  # API Gateway endpoint for real-time quota checks
+    quota_fail_mode: str = "closed"  # "closed" (deny on error) or "open" (explicit allow on error)
+    quota_check_interval: int = 30  # Minutes between quota re-checks (0 = every request)
+    enable_bypass_detection: bool = False  # Detect Bedrock use without a running OTEL sidecar (opt-in)
+
+    # Server-side metering (quota-metering stack, opt-in, default off).
+    # Deploys a per-region trio (Bedrock invocation logging + log group +
+    # processor Lambda) to every allowed Bedrock region and accrues tamper-proof
+    # server_* usage attributes onto UserQuotaMetrics. Deploy-side only: not
+    # written to the client config.json and NOT mirrored in the Go ProfileConfig
+    # (config-sync.md), following the gateway_* precedent.
+    metering_enabled: bool = False  # Enable server-side usage metering from Bedrock invocation logs
+    metering_mode: str = "shadow"  # "shadow" (collect + reconcile only) or "max" (enforce on max(client, server))
+
+    # Model lifecycle alerts (model-lifecycle stack, opt-in, default off, ~$0/mo).
+    # Daily Lambda joins ListFoundationModels lifecycle dates against the models
+    # this deployment references (SSM tracked-models parameter seeded at deploy)
+    # and publishes an SNS alert ladder (legacy / premium-30d / EOL-60/30/7d),
+    # plus an aws.health Bedrock rule. Deploy-side only: NOT written to the
+    # client config.json and NOT mirrored in the Go ProfileConfig (config-sync.md).
+    model_lifecycle_enabled: bool = False
+
+    # Bedrock Guardrails enforcement (guardrails-enforcement stack, opt-in, default off).
+    # Deploys one regional stack per allowed Bedrock region: a guardrail, immutable
+    # guardrail version, account-level enforced guardrail configuration, and a
+    # metadata-only CloudWatch dashboard. Mirrored into the Go ProfileConfig for
+    # config schema parity, but the credential helper does not enforce it.
+    guardrails_enabled: bool = False
+    guardrails_name: str = ""  # Empty derives <identity_pool_name>-guardrail, truncated to Bedrock's 50-char max.
+    guardrails_content_filter_strength: str = "MEDIUM"  # LOW | MEDIUM | HIGH
+    guardrails_model_include_list: list[str] = field(default_factory=list)  # Empty = enforce all models in the region
+    guardrails_kms_key_arn: str | None = None
+
+    # Monitoring endpoint (saved from deploy, avoids re-reading CloudFormation outputs)
+    otel_collector_endpoint: str | None = None  # OTel collector ALB endpoint URL
+    # Deploy/package-only capability signal. This is populated only from the
+    # monitoring stack's conditional VerifiedCollectorEndpoint output and is not
+    # written into the end-user Go credential-process config.
+    otel_verified_collector_endpoint: str | None = None
+
+    # Federation configuration
+    federation_type: str = "cognito"  # "cognito" or "direct"
+    federated_role_arn: str | None = None  # ARN for Direct STS federation
+    max_session_duration: int = 28800  # 8 hours default, 43200 (12 hours) for Direct STS
+    # Mirrors the auth stack's SessionNameBinding parameter ("none" | "email" | "sub").
+    # When "email"/"sub", the Direct STS role trust policy requires the STS
+    # RoleSessionName to equal that IdP-signed token claim (tamper-proof CUR
+    # attribution); mirrored into config.json / Go ProfileConfig (config-sync).
+    session_name_binding: str = "none"
+    sso_enabled: bool = True  # Enable SSO authentication (Okta, Auth0, Azure, Cognito)
+
+    # Authentication type — explicit three-way classification
+    # "oidc"  = OIDC/Direct IdP path (Okta, Azure AD, Auth0, Cognito, Google) — default
+    # "idc"   = AWS IAM Identity Center path
+    # "none"  = no SSO, use existing AWS credentials directly
+    auth_type: str = "oidc"
+
+    # IAM Identity Center specific fields (only populated when auth_type == "idc")
+    idc_start_url: str | None = None  # e.g. https://company.awsapps.com/start
+    idc_account_id: str | None = None  # AWS account ID for IDC access
+    idc_permission_set_name: str | None = None  # Permission set / role name
+    sso_region: str | None = None  # AWS region where Identity Center is configured
+
+    # Confidential client authentication (Azure AD / Entra ID)
+    # If neither is set, public client flow is used (current default).
+    # If azure_auth_mode == "secret", the client secret is stored in the OS keyring
+    #   (never in config.json). Read at runtime via keyring by the credential provider.
+    # If azure_auth_mode == "certificate", certificate paths are stored in config.json
+    #   and used to build a signed JWT assertion.
+    azure_auth_mode: str | None = None  # "public", "secret", or "certificate"
+    client_secret: str | None = None  # In-memory only — loaded from OS keyring at runtime
+    client_certificate_path: str | None = None  # Path to PEM certificate file
+    client_certificate_key_path: str | None = None  # Path to PEM private key file
+
+    # OAuth callback port (also used for inter-process locking)
+    redirect_port: int | None = None  # OAuth callback port (default 8400); must match IdP registered redirect URI
+
+    # Resource tagging
+    tags: dict[str, str] = field(default_factory=dict)  # Tags applied to all deployed CloudFormation stacks
+    # Application Inference Profile support (per-tier ARNs)
+    inference_profile_opus_arn: str | None = None  # Optional inference profile ARN for Opus tier
+    inference_profile_sonnet_arn: str | None = None  # Optional inference profile ARN for Sonnet tier
+    inference_profile_haiku_arn: str | None = None  # Optional inference profile ARN for Haiku tier
+    restrict_to_anthropic_models: bool = True  # Deploy auth stacks with server-side Anthropic model scoping by default
+
+    # Claude Code settings configuration
+    include_coauthored_by: bool = True  # Whether to include "co-authored-by Claude" in git commits
+
+    # Settings deployment target
+    # "user" = ~/.claude/settings.json (default, lowest precedence)
+    # "managed" = OS-level managed-settings.json (highest precedence, non-overridable)
+    settings_target: str = "user"
+
+    # Claude Cowork 3P MDM configuration
+    cowork_3p_enabled: bool = True  # Generate CoWork 3P MDM configs during packaging
+    cowork_3p_extra_keys: dict[str, str] = field(default_factory=dict)  # Custom MDM keys merged into CoWork 3P output
+    cowork_service_token: str = ""  # Static token for CoWork ALB auth bypass (set during init)
+    cowork_credential_mode: str = (
+        "helper"  # "helper" (inferenceCredentialHelper) or "profile" (inferenceBedrockProfile)
+    )
+    cowork_credential_helper_ttl_sec: int = 3500  # inferenceCredentialHelperTtlSec (refresh before 1h STS expiry)
+    cowork_config_delivery: str = "static"  # legacy bootstrap values load for migration but are not deployable
+
+    # Cowork beta features (managed configuration keys)
+    cowork_chat_tab_enabled: bool = True  # chatTabEnabled — enables the Chat tab
+    cowork_chat_advanced_file_analysis: bool = (
+        True  # chatAdvancedFileAnalysisEnabled — code execution for file analysis
+    )
+    cowork_inference_session_lifetime_sec: int | None = None  # inferenceSessionLifetimeSec — re-auth reminder timer
+    # Web search (AgentCore Gateway + managed Web Search connector)
+    # Opt-in, default off. Deploys an optional AgentCore Gateway stack whose
+    # inbound CUSTOM_JWT authorizer reuses the existing OIDC IdP. The gateway
+    # serves both Claude Code (via headersHelper) and Claude Cowork (via MDM).
+    web_search_enabled: bool = False  # Enable the web search gateway
+    websearch_gateway_url: str = ""  # Gateway MCP endpoint URL (populated after deploy)
+    websearch_region: str | None = None  # Region for the gateway stack (allow-list; None = default us-east-1)
+    websearch_jwt_audience: str | None = None  # Entra ID (audience mode) only: aud the authorizer accepts
+    websearch_domain_denylist: list[str] = field(default_factory=list)  # Optional domains to exclude from results
+    websearch_entitled_groups: list[str] = field(
+        default_factory=list
+    )  # IdP groups entitled to call the gateway (empty = any valid id_token, current behavior)
+    websearch_policy_mode: str = "LOG_ONLY"  # Cedar policy engine mode when entitled groups are set: LOG_ONLY | ENFORCE
+    websearch_deployment_mode: str = "development"  # development | production; production activates static policy gates
+    websearch_policy_validation_complete: bool = False  # Acknowledge observed LOG_ONLY decisions before production
+    websearch_headers_helper_path: str = (
+        ""  # Absolute path override for the Cowork headersHelper (default: ~/gip/websearch-headers)
+    )
+
+    # AgentCore Memory (opt-in content-bearing feature — axiom A3, ADR-0016).
+    # Attaches user/org memory tools to the EXISTING web search gateway as a
+    # second GatewayTarget (separate stack, independent lifecycle). Deploy-side
+    # only: not written to the client config.json and NOT mirrored in the Go
+    # ProfileConfig (config-sync.md), following the gateway_* precedent.
+    memory_enabled: bool = False  # Enable the memory stack (requires web_search_enabled + deployed gateway)
+    memory_user_enabled: bool = False  # Per-user memory (users/{actorId}/... namespaces + memory_* tools)
+    memory_org_enabled: bool = False  # Shared org knowledge (org/knowledge namespace + org_knowledge_* tools)
+    memory_mode: str = "extracted-only"  # "extracted-only" (raw events purged at T+24h, 3-day floor) or "full"
+    memory_raw_event_retention_days: int = 30  # Raw event retention, full mode only (3-365)
+    memory_kms_key_arn: str | None = None  # Optional existing CMK ARN (replacement-on-update — set before first deploy)
+    memory_org_write_groups: list[str] = field(
+        default_factory=list
+    )  # IdP groups allowed org_knowledge_add (empty = admins only)
+    memory_deploy_gate: str = "log-only"  # actorId-binding verification gate: "log-only" | "active" (ADR-0016)
+    memory_id: str = ""  # Memory resource ID (populated after deploy; used by 'gip memory' commands)
+    # Governed skills registry (AWS Agent Registry + S3 artifact store).
+    # Opt-in, default off. Deploys deployment/infrastructure/skills-registry.yaml
+    # (`gip deploy skills`); see assets/docs/SKILLS_REGISTRY.md and ADR-0017.
+    skills_registry_enabled: bool = False  # Enable the skills registry stack
+    skills_registry_name: str = "gip-skills"  # Agent Registry name (adopted if it already exists)
+    skills_publisher_groups: list[str] = field(default_factory=list)  # IdP groups gating PublisherRole
+    skills_curator_groups: list[str] = field(default_factory=list)  # IdP groups gating CuratorRole
+    skills_organization_id: str = ""  # AWS Organizations ID for org-wide artifact read (empty = off)
+    skills_artifact_bucket: str = ""  # ArtifactBucket stack output (populated after deploy)
+    skills_registry_id: str = ""  # RegistryId stack output (populated after deploy)
+    skills_distributor_function: str = ""  # DistributorFunctionArn stack output (populated after deploy)
+
+    # Legacy local Claude Apps Gateway fields. New deployments use the exact
+    # AWS Samples CDK mirrored under vendor/aws-samples/anthropic-on-aws.
+    # Keep these defaults only so persisted pre-migration profiles still load
+    # and can identify old stacks for explicit `gip destroy gateway` cleanup.
+    gateway_enabled: bool = False
+    gateway_image: str | None = None  # Container image URI with the pinned claude binary (>= 2.1.195)
+    gateway_image_digest: str | None = None  # Optional sha256 digest; embedded legacy digests are normalized at deploy
+    gateway_deployment_mode: str = "development"  # development | production; production activates static gates
+    gateway_public_url: str | None = None  # https:// private DNS origin, e.g. https://claude-gw.internal.example.com
+    gateway_certificate_arn: str | None = None  # ACM certificate ARN for the PublicUrl hostname
+    gateway_vpc_id: str | None = None  # VPC for the gateway service, internal ALB, and database
+    gateway_subnet_ids: list[str] = field(default_factory=list)  # >= 2 private subnets in distinct AZs
+    gateway_oidc_client_secret_arn: str | None = None  # Optional Secrets Manager ARN holding the OIDC client secret
+    gateway_allowed_email_domains: str | None = None  # Comma-separated email domains allowed to sign in
+    gateway_inference_profile_prefix: str = "us"  # Geographic CRIS boundary (us/eu/apac/au/jp; global is rejected)
+    gateway_db_multi_az: bool = False  # Enable RDS Multi-AZ; required in production mode
+    gateway_db_deletion_protection: bool = False  # Enable RDS deletion protection; required in production mode
+    gateway_desired_count: int = 2  # ECS task count; production requires at least two
+    gateway_stack_url: str | None = None  # GatewayUrl stack output (populated after deploy)
+
+    # Admin-only extra files copied into the package on top of generated artifacts.
+    # Consumed ONLY by `package`/`distribute` — deliberately NOT mirrored in the Go
+    # ProfileConfig (config-sync.md) and NOT written to the runtime config.json.
+    # Each entry: {"name": str, "targets": str | list[str], "from": str}
+    extra_files: list[dict[str, Any]] = field(default_factory=list)
+
+    # Additive model-catalog overlay (ADR-0018). Lets an admin expose a
+    # just-launched Bedrock model before the repo catalog ships it:
+    # {model_key: {name, base_model_id, profiles: {geo: {model_id,
+    # source_regions, destination_regions, description?}}}}. Validated strictly
+    # at load (models.validate_extra_models); additive only — entries can never
+    # override catalog entries and are excluded from tier fallback chains.
+    # Populated with `gip models check --propose` output. Init/package-side
+    # only: NOT written to the runtime config.json and NOT mirrored in the Go
+    # ProfileConfig (config-sync.md — same precedent as extra_files/harnesses).
+    extra_models: dict[str, Any] = field(default_factory=dict)
+
+    # Coding harnesses to generate configs for during packaging. "claude-code"
+    # is always packaged; extra entries (opencode, codex, pi, aider) add
+    # harnesses/<name>/ config files to the package output (see
+    # cli/utils/harness_configs.py). Packaging-side only — deliberately NOT
+    # mirrored in the Go ProfileConfig (config-sync.md) and NOT written to the
+    # runtime config.json.
+    harnesses: list[str] = field(default_factory=lambda: ["claude-code"])
+
+    # Legacy field support
+    @property
+    def okta_domain(self) -> str:
+        """Legacy property for backward compatibility."""
+        return self.provider_domain
+
+    @property
+    def okta_client_id(self) -> str:
+        """Legacy property for backward compatibility."""
+        return self.client_id
+
+    @property
+    def effective_auth_type(self) -> str:
+        """Resolve auth_type with backward compatibility for sso_enabled."""
+        if hasattr(self, "auth_type") and self.auth_type:
+            return self.auth_type
+        return "oidc" if self.sso_enabled else "none"
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert profile to dictionary."""
+        data = asdict(self)
+        if data.get("provider_type") != "google":
+            data.pop("client_secret", None)
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Profile":
+        """Create profile from dictionary with migration support."""
+        # Set schema_version if not present (migrating from v1.0)
+        if "schema_version" not in data:
+            data["schema_version"] = "2.0"
+
+        # Migrate old field names to new ones
+        if "okta_domain" in data and "provider_domain" not in data:
+            data["provider_domain"] = data.pop("okta_domain")
+        if "okta_client_id" in data and "client_id" not in data:
+            data["client_id"] = data.pop("okta_client_id")
+
+        # Remove any remaining old fields to avoid conflicts
+        data.pop("okta_domain", None)
+        data.pop("okta_client_id", None)
+
+        # Provide default for credential_storage if not present
+        if "credential_storage" not in data:
+            data["credential_storage"] = "session"
+
+        # Derive auth_type from sso_enabled for backward compatibility
+        if "auth_type" not in data:
+            if data.get("sso_enabled", True):
+                data["auth_type"] = "oidc"
+            else:
+                data["auth_type"] = "none"
+
+        # Infer sso_enabled for profiles saved before PR #71 introduced the field:
+        # if provider_domain is set to a real value, SSO was enabled.
+        if "sso_enabled" not in data:
+            domain = data.get("provider_domain", "none")
+            data["sso_enabled"] = bool(domain and domain != "none")
+
+        # Auto-detect provider type if not set
+        if "provider_type" not in data and "provider_domain" in data:
+            domain = data["provider_domain"]
+            # Secure provider detection using proper URL parsing
+            if domain:
+                # Handle both full URLs and domain-only inputs
+                url_to_parse = domain if domain.startswith(("http://", "https://")) else f"https://{domain}"
+
+                try:
+                    from urllib.parse import urlparse
+
+                    parsed = urlparse(url_to_parse)
+                    hostname = parsed.hostname
+
+                    if hostname:
+                        hostname_lower = hostname.lower()
+
+                        # Check for exact domain match or subdomain match
+                        # Using endswith with leading dot prevents bypass attacks
+                        okta_domains = (".okta.com", ".oktapreview.com", ".okta-emea.com")
+                        if hostname_lower.endswith(okta_domains) or hostname_lower in (
+                            "okta.com",
+                            "oktapreview.com",
+                            "okta-emea.com",
+                        ):
+                            data["provider_type"] = "okta"
+                        elif hostname_lower.endswith(".auth0.com") or hostname_lower == "auth0.com":
+                            data["provider_type"] = "auth0"
+                        elif hostname_lower.endswith(".microsoftonline.com") or hostname_lower == "microsoftonline.com":
+                            data["provider_type"] = "azure"
+                        elif hostname_lower.endswith(".windows.net") or hostname_lower == "windows.net":
+                            data["provider_type"] = "azure"
+                        elif hostname_lower.endswith(".amazoncognito.com") or hostname_lower == "amazoncognito.com":
+                            data["provider_type"] = "cognito"
+                        elif hostname_lower.startswith("cognito-idp.") and ".amazonaws.com" in hostname_lower:
+                            data["provider_type"] = "cognito"
+                        elif hostname_lower == "accounts.google.com":
+                            data["provider_type"] = "google"
+                except Exception:
+                    pass  # Leave provider_type unset if parsing fails
+
+        # Migrate legacy distribution configuration
+        if "enable_distribution" in data and data.get("enable_distribution"):
+            # If distribution was enabled but no type specified, default to presigned-s3
+            if "distribution_type" not in data or data["distribution_type"] is None:
+                data["distribution_type"] = "presigned-s3"
+
+        # Ensure monitoring_mode defaults to "central" for existing profiles
+        # (new profiles created via init will explicitly set "sidecar")
+        if "monitoring_mode" not in data:
+            data["monitoring_mode"] = "central"
+
+        # Accept the nested answers-file shape if a user copies it into a profile.
+        guardrails = data.get("guardrails")
+        if isinstance(guardrails, dict):
+            data.setdefault("guardrails_enabled", guardrails.get("enabled", False))
+            data.setdefault("guardrails_name", guardrails.get("name") or "")
+            data.setdefault(
+                "guardrails_content_filter_strength",
+                guardrails.get("content_filter_strength", "MEDIUM"),
+            )
+            data.setdefault("guardrails_model_include_list", guardrails.get("model_include_list") or [])
+            data.setdefault("guardrails_kms_key_arn", guardrails.get("kms_key_arn") or None)
+
+        # Set default cross-region profile if not present
+        if "cross_region_profile" not in data:
+            # Default to 'us' for existing deployments with US regions
+            if "allowed_bedrock_regions" in data:
+                regions = data["allowed_bedrock_regions"]
+                if any(r.startswith("us-") for r in regions):
+                    data["cross_region_profile"] = "us"
+
+        # Filter out any keys not in the Profile dataclass to prevent TypeError
+        import dataclasses
+
+        valid_fields = {f.name for f in dataclasses.fields(cls)}
+        data = {k: v for k, v in data.items() if k in valid_fields}
+
+        return cls(**data)
+
+
+class Config:
+    """Configuration manager for the Governed Inference Platform."""
+
+    # Location in user home directory
+    CONFIG_DIR = Path.home() / ".gip"
+    CONFIG_FILE = CONFIG_DIR / "config.json"
+    PROFILES_DIR = CONFIG_DIR / "profiles"
+
+    def __init__(self, active_profile: str | None = None, schema_version: str = "2.0"):
+        """Initialize configuration."""
+        self.active_profile = active_profile
+        self.schema_version = schema_version
+        self._ensure_config_dir()
+
+    def _ensure_config_dir(self) -> None:
+        """Ensure configuration directories exist."""
+        self.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        self.PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+        self.CONFIG_DIR.chmod(0o700)
+        self.PROFILES_DIR.chmod(0o700)
+
+    @classmethod
+    def load(cls) -> "Config":
+        """Load global configuration from file."""
+        # Load global config
+        if cls.CONFIG_FILE.exists():
+            try:
+                with open(cls.CONFIG_FILE, encoding="utf-8") as f:
+                    data = json.load(f)
+
+                return cls(
+                    active_profile=data.get("active_profile"),
+                    schema_version=data.get("schema_version", "2.0"),
+                )
+
+            except Exception as e:
+                print(f"Warning: Could not load config: {e}")
+                return cls()
+        else:
+            return cls()
+
+    def save(self) -> None:
+        """Save global configuration to file."""
+        data = {
+            "schema_version": self.schema_version,
+            "active_profile": self.active_profile,
+            "profiles_dir": str(self.PROFILES_DIR),
+        }
+
+        with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        self.CONFIG_FILE.chmod(0o600)
+
+    def load_profile(self, name: str | None = None) -> Profile:
+        """Load a specific profile or the active profile.
+
+        Args:
+            name: Profile name to load. If None, loads active profile.
+
+        Returns:
+            Profile object.
+
+        Raises:
+            ValueError: If no profile specified and no active profile set.
+            FileNotFoundError: If profile file doesn't exist.
+        """
+        profile_name = name or self.active_profile
+
+        if not profile_name:
+            raise ValueError("No profile specified and no active profile set")
+
+        profile_path = self.PROFILES_DIR / f"{profile_name}.json"
+
+        if not profile_path.exists():
+            raise FileNotFoundError(f"Profile not found: {profile_name}")
+
+        try:
+            with open(profile_path, encoding="utf-8") as f:
+                data = json.load(f)
+
+            return Profile.from_dict(data)
+
+        except Exception as e:
+            raise ValueError(f"Could not load profile {profile_name}: {e}") from e
+
+    def save_profile(self, profile: Profile) -> None:
+        """Save a profile to its individual file.
+
+        Args:
+            profile: Profile to save.
+        """
+        # Validate profile name
+        if not self._is_valid_profile_name(profile.name):
+            raise ValueError(
+                f"Invalid profile name: {profile.name}. Name must be alphanumeric with hyphens only, max 64 characters."
+            )
+
+        # Update timestamp
+        profile.updated_at = datetime.now(timezone.utc).isoformat()
+
+        # Ensure profile directory exists
+        self.PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+        self.PROFILES_DIR.chmod(0o700)
+
+        # Save to file
+        profile_path = self.PROFILES_DIR / f"{profile.name}.json"
+
+        with open(profile_path, "w", encoding="utf-8") as f:
+            json.dump(profile.to_dict(), f, indent=2)
+        profile_path.chmod(0o600)
+
+        # Set as active if it's the first profile
+        if not self.active_profile and not self.list_profiles():
+            self.active_profile = profile.name
+            self.save()
+        elif not self.active_profile:
+            # If no active profile set, set this one
+            self.active_profile = profile.name
+            self.save()
+
+    def list_profiles(self) -> list[str]:
+        """List all available profile names.
+
+        Returns:
+            Sorted list of profile names.
+        """
+        if not self.PROFILES_DIR.exists():
+            return []
+
+        return sorted([p.stem for p in self.PROFILES_DIR.glob("*.json")])
+
+    def delete_profile(self, name: str) -> bool:
+        """Delete a profile.
+
+        Args:
+            name: Name of profile to delete.
+
+        Returns:
+            True if deleted, False if profile doesn't exist.
+        """
+        profile_path = self.PROFILES_DIR / f"{name}.json"
+
+        if not profile_path.exists():
+            return False
+
+        profile_path.unlink()
+
+        # Auto-switch if deleting active profile
+        if self.active_profile == name:
+            remaining_profiles = self.list_profiles()
+            if remaining_profiles:
+                self.active_profile = remaining_profiles[0]
+                print(f"⚠️  Warning: Active profile '{name}' deleted. Switched to '{self.active_profile}'")
+            else:
+                self.active_profile = None
+                print(f"⚠️  Warning: Active profile '{name}' deleted. No profiles remaining.")
+            self.save()
+
+        return True
+
+    def set_active_profile(self, name: str) -> bool:
+        """Set the active profile.
+
+        Args:
+            name: Name of profile to set as active.
+
+        Returns:
+            True if set successfully, False if profile doesn't exist.
+        """
+        profile_path = self.PROFILES_DIR / f"{name}.json"
+
+        if not profile_path.exists():
+            return False
+
+        self.active_profile = name
+        self.save()
+        return True
+
+    def get_profile(self, name: str | None = None) -> Profile | None:
+        """Get a profile by name or the active profile (compatibility method).
+
+        Args:
+            name: Profile name to load. If None, loads active profile.
+
+        Returns:
+            Profile object or None if not found.
+        """
+        try:
+            return self.load_profile(name)
+        except (ValueError, FileNotFoundError):
+            return None
+
+    @staticmethod
+    def _is_valid_profile_name(name: str) -> bool:
+        """Validate profile name.
+
+        Args:
+            name: Profile name to validate.
+
+        Returns:
+            True if valid, False otherwise.
+        """
+        import re
+
+        if not name or len(name) > 64:
+            return False
+
+        # Allow alphanumeric and hyphens only
+        return bool(re.match(r"^[a-zA-Z0-9\-]+$", name))
+
+    # Compatibility methods for legacy code
+    def add_profile(self, profile: Profile) -> None:
+        """Add or update a profile (compatibility method)."""
+        self.save_profile(profile)
+
+    @property
+    def default_profile(self) -> str | None:
+        """Legacy property for backward compatibility."""
+        return self.active_profile
+
+    @default_profile.setter
+    def default_profile(self, value: str | None) -> None:
+        """Legacy property setter for backward compatibility."""
+        self.active_profile = value
+
+    def set_default_profile(self, name: str) -> bool:
+        """Set the default profile (compatibility method)."""
+        return self.set_active_profile(name)
+
+    @property
+    def profiles(self) -> dict[str, Profile]:
+        """Legacy property to load all profiles (compatibility method).
+
+        WARNING: This loads all profiles into memory. For large numbers of profiles,
+        prefer using load_profile() to load individual profiles on demand.
+        """
+        result = {}
+        for profile_name in self.list_profiles():
+            try:
+                result[profile_name] = self.load_profile(profile_name)
+            except Exception:
+                pass  # Skip profiles that fail to load
+        return result
+
+    def get_aws_config_for_profile(self, profile_name: str | None = None) -> dict[str, Any]:
+        """Get AWS configuration for CloudFormation deployment."""
+        profile = self.get_profile(profile_name)
+        if not profile:
+            raise ValueError(f"Profile not found: {profile_name}")
+
+        return {
+            "OktaDomain": profile.okta_domain,
+            "OktaClientId": profile.okta_client_id,
+            "IdentityPoolName": profile.identity_pool_name,
+            "AllowedBedrockRegions": ",".join(profile.allowed_bedrock_regions),
+            "EnableMonitoring": "true" if profile.monitoring_enabled else "false",
+        }

@@ -1,0 +1,684 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Amazon Bedrock AgentCore Memory for Claude Code / Claude Cowork (opt-in,
+  ADR-0016). Attaches user-memory and org-knowledge MCP tools to the EXISTING
+  web search gateway (separate-stack GatewayTarget). Default mode is
+  'extracted-only': raw conversational events are retained at most 3 days (the
+  service minimum for EventExpiryDuration) and a daily sweeper deletes events
+  older than the extraction window; only extracted facts/preferences persist.
+  CONTENT WARNING: this stack stores conversation-derived content (axiom A3 —
+  opt-in, isolated, erasable). See assets/docs/MEMORY.md for the data
+  classification and erasure procedures.
+
+Metadata:
+  DataResidency:
+    Note: >-
+      Memory contents are conversation-derived and are stored and processed in
+      the region this stack deploys to (the web search gateway region,
+      us-east-1 today), regardless of where Bedrock inference or the IDE
+      session runs. Long-term extraction runs asynchronous LLM inference over
+      raw events inside the same region. Review compliance impact (GDPR, data
+      sovereignty) before enabling.
+  SecurityGate:
+    Note: >-
+      Lambda gateway targets receive no usable caller identity context (F-008),
+      and AgentCore rejects Authorization in AllowedRequestHeaders. DeployGate
+      is therefore fixed to 'log-only': identity-dependent tools answer with a
+      gated response and never touch the data plane. User memory cannot be
+      activated until identity propagation is redesigned. See ADR-0016.
+
+Parameters:
+  IdentityPoolName:
+    Type: String
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]{0,40}$'
+    Description: >-
+      Stack base name (the profile's identity_pool_name). Used to derive the
+      Memory resource name, which is REPLACEMENT-ON-UPDATE: it must stay
+      stable across redeployments or the memory store (and all records in it)
+      is destroyed and recreated.
+
+  GatewayIdentifier:
+    Type: String
+    AllowedPattern: '^([0-9a-z][-]?){1,100}-[0-9a-z]{10}$'
+    Description: >-
+      Identifier of the EXISTING AgentCore web search gateway (GatewayId
+      output of the websearch stack). The memory tools attach to it as a
+      second, independently-lifecycled GatewayTarget.
+
+  GatewayExecutionRoleArn:
+    Type: String
+    AllowedPattern: '^arn:[a-z-]+:iam::[0-9]{12}:role/.+$'
+    Description: >-
+      Execution role ARN of the existing gateway (GatewayExecutionRoleArn
+      output of the websearch stack). Granted lambda:InvokeFunction on the
+      memory-tools Lambda via a resource policy so the gateway can invoke the
+      target without modifying the websearch stack.
+
+  EnableUserMemory:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Enable per-user memory (userPreference + semantic strategies on
+      users/{actorId}/... namespaces, plus the memory_store / memory_retrieve
+      tools). Disabled by default (axiom A3/A7).
+
+  EnableOrgMemory:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Enable shared organizational knowledge (semantic strategy on the
+      org/knowledge namespace, plus the org_knowledge_search /
+      org_knowledge_add tools). Disabled by default (axiom A3/A7).
+
+  MemoryMode:
+    Type: String
+    Default: 'extracted-only'
+    AllowedValues: ['extracted-only', 'full']
+    Description: >-
+      'extracted-only' (default, ADR-0012 D4): raw events are pinned to the
+      3-day service minimum and a daily sweeper deletes events older than the
+      extraction window — only extracted records persist. 'full': raw events
+      are retained for RawEventRetentionDays and no sweeper is deployed.
+
+  RawEventRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 365
+    Description: >-
+      Raw event retention in days — full mode only (extracted-only pins
+      EventExpiryDuration to 3, the service minimum).
+
+  KmsKeyArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional existing customer-managed KMS key ARN for memory encryption.
+      Empty = this stack creates a dedicated CMK. EncryptionKeyArn is
+      REPLACEMENT-ON-UPDATE: decide before the first deploy and never change
+      it, or the memory store is destroyed.
+
+  OrgMemoryWriteGroups:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >-
+      IdP group names whose members may publish via the org_knowledge_add
+      tool (matched against the gateway-forwarded JWT groups/cognito:groups
+      claim). Empty (default) = admins only: the tool denies all writers and
+      org knowledge is curated out-of-band via the data plane
+      (BatchCreateMemoryRecords).
+
+  DeployGate:
+    Type: String
+    Default: 'log-only'
+    AllowedValues: ['log-only']
+    Description: >-
+      actorId-binding safety gate (ADR-0016). Only 'log-only' is currently
+      supported because AgentCore rejects Authorization-header forwarding.
+      Identity-dependent tools (memory_store, memory_retrieve,
+      org_knowledge_add) return a gated response and perform no data-plane
+      writes/reads. Activation requires a future identity-propagation redesign.
+
+  AlarmTopicArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional SNS topic ARN (this region) for the fail-visible alarms.
+      Empty = alarms are created without notification actions.
+
+Rules:
+  AtLeastOneMemoryScope:
+    Assertions:
+      - Assert: !Or
+          - !Equals [!Ref EnableUserMemory, 'true']
+          - !Equals [!Ref EnableOrgMemory, 'true']
+        AssertDescription: >-
+          Enable at least one of EnableUserMemory / EnableOrgMemory — an empty
+          memory stack has no strategies and no tools.
+
+Conditions:
+  HasUserMemory: !Equals [!Ref EnableUserMemory, 'true']
+  HasOrgMemory: !Equals [!Ref EnableOrgMemory, 'true']
+  IsExtractedOnly: !Equals [!Ref MemoryMode, 'extracted-only']
+  HasKmsKey: !Not [!Equals [!Ref KmsKeyArn, '']]
+  CreateKmsKey: !Not [!Condition HasKmsKey]
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, '']]
+
+Resources:
+  # Dedicated CMK when the deployer does not bring one (axiom A3: CMK
+  # encryption where supported). Created before first Memory deploy because
+  # EncryptionKeyArn is replacement-on-update.
+  MemoryKmsKey:
+    Type: AWS::KMS::Key
+    Condition: CreateKmsKey
+    Properties:
+      Description: !Sub 'CMK for the ${IdentityPoolName} AgentCore Memory store (conversation-derived content)'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AgentCoreMemoryUse
+            Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+              - kms:CreateGrant
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  MemoryKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: CreateKmsKey
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-memory'
+      TargetKeyId: !Ref MemoryKmsKey
+
+  # The memory store. Name and EncryptionKeyArn are REPLACEMENT-ON-UPDATE
+  # (R9 F10): the name derives from IdentityPoolName (stable across stack
+  # operations) with hyphens converted to underscores (the Name pattern
+  # ^[a-zA-Z][a-zA-Z0-9_]{0,47}$ forbids hyphens — R9 risk 7).
+  ToolsMemory:
+    Type: AWS::BedrockAgentCore::Memory
+    # The BedrockAgentCore Memory/GatewayTarget resource schemas are newer
+    # than the spec bundled with current cfn-lint (same lag as the websearch
+    # Connector target). Suppress the affected checks locally until the
+    # cfn-lint resource spec catches up; shapes follow the CFN Template
+    # Reference (R9 F10/F11) and are validated against a live sandbox deploy.
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3002
+            - E3003
+            - E3018
+    Properties:
+      Name: !Join ['_', !Split ['-', !Sub '${IdentityPoolName}-memory']]
+      Description: >-
+        Opt-in user/org memory for Governed Inference Platform on Amazon Bedrock. Stores
+        conversation-derived content; see assets/docs/MEMORY.md.
+      # extracted-only pins the 3-day service minimum (raw events cannot live
+      # shorter — R9 F10); the sweeper deletes them at T+24h. full mode uses
+      # the configured retention.
+      EventExpiryDuration: !If [IsExtractedOnly, 3, !Ref RawEventRetentionDays]
+      EncryptionKeyArn: !If [HasKmsKey, !Ref KmsKeyArn, !GetAtt MemoryKmsKey.Arn]
+      MemoryStrategies:
+        - !If
+          - HasUserMemory
+          - UserPreferenceMemoryStrategy:
+              Name: UserPreferences
+              Namespaces:
+                - 'users/{actorId}/preferences'
+          - !Ref 'AWS::NoValue'
+        - !If
+          - HasUserMemory
+          - SemanticMemoryStrategy:
+              Name: UserFacts
+              Namespaces:
+                - 'users/{actorId}/facts'
+          - !Ref 'AWS::NoValue'
+        - !If
+          - HasOrgMemory
+          - SemanticMemoryStrategy:
+              Name: OrgKnowledge
+              Namespaces:
+                - 'org/knowledge'
+          - !Ref 'AWS::NoValue'
+
+  # ============================================
+  # Memory tools Lambda (MCP gateway target)
+  # ============================================
+
+  MemoryToolsRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Single-purpose policy scoped to this role and this memory store
+          # only - converting to a managed policy adds no security.
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: memory-tools
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Fleet-level namespace scoping (R9 F12): the retrieval APIs
+              # honor bedrock-agentcore:namespacePath, so the role can only
+              # read user and org paths — never other namespaces in the
+              # account. Per-user isolation on top of this comes from the
+              # server-derived actorId (never a tool argument; ADR-0016).
+              - !If
+                - HasUserMemory
+                - Sid: UserNamespaceReads
+                  Effect: Allow
+                  Action:
+                    - bedrock-agentcore:RetrieveMemoryRecords
+                    - bedrock-agentcore:ListMemoryRecords
+                  Resource: !GetAtt ToolsMemory.MemoryArn
+                  Condition:
+                    StringLike:
+                      'bedrock-agentcore:namespacePath': 'users/*'
+                - !Ref 'AWS::NoValue'
+              - !If
+                - HasUserMemory
+                - Sid: UserEventWrites
+                  Effect: Allow
+                  Action:
+                    - bedrock-agentcore:CreateEvent
+                  Resource: !GetAtt ToolsMemory.MemoryArn
+                - !Ref 'AWS::NoValue'
+              - !If
+                - HasOrgMemory
+                - Sid: OrgNamespaceReads
+                  Effect: Allow
+                  Action:
+                    - bedrock-agentcore:RetrieveMemoryRecords
+                    - bedrock-agentcore:ListMemoryRecords
+                  Resource: !GetAtt ToolsMemory.MemoryArn
+                  Condition:
+                    StringLike:
+                      'bedrock-agentcore:namespacePath': 'org/*'
+                - !Ref 'AWS::NoValue'
+              - !If
+                - HasOrgMemory
+                - Sid: OrgRecordWrites
+                  Effect: Allow
+                  Action:
+                    - bedrock-agentcore:BatchCreateMemoryRecords
+                  Resource: !GetAtt ToolsMemory.MemoryArn
+                - !Ref 'AWS::NoValue'
+
+  MemoryToolsFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Invoked by the AgentCore gateway; talks only to the bedrock-agentcore data plane — VPC adds complexity without security benefit"
+          - id: W92
+            reason: "Interactive tool calls at human scale — reserved concurrency unnecessary"
+      guard:
+        SuppressedRules:
+          # The gateway invokes this function synchronously (RequestResponse)
+          # - a DLQ is never used on this invoke path.
+          - LAMBDA_DLQ_CHECK
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-memory-tools'
+      Description: MCP tool implementations (memory_store/memory_retrieve/org_knowledge_search/org_knowledge_add) with server-derived actorId (never a tool argument)
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt MemoryToolsRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          MEMORY_ID: !GetAtt ToolsMemory.MemoryId
+          DEPLOY_GATE: !Ref DeployGate
+          ENABLE_USER_MEMORY: !Ref EnableUserMemory
+          ENABLE_ORG_MEMORY: !Ref EnableOrgMemory
+          ORG_WRITE_GROUPS: !Join [',', !Ref OrgMemoryWriteGroups]
+      Code: ./lambda-functions/memory_tools/
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-memory-tools'
+        - Key: Purpose
+          Value: AgentCore Memory MCP tools behind the web search gateway
+
+  # The gateway invokes Lambda targets with its execution role
+  # (CredentialProviderType GATEWAY_IAM_ROLE). Same-account resource policy
+  # grants that role invoke access without touching the websearch stack.
+  MemoryToolsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Scanner misread (rule engine type error: "PathAwareValues are not
+          # comparable map, int"). Principal is a specific IAM role ARN
+          # (GatewayExecutionRoleArn parameter), not a service principal or
+          # "*" - the grant is scoped to exactly one role, so no public
+          # access is possible and SourceArn/SourceAccount do not apply.
+          - LAMBDA_FUNCTION_PUBLIC_ACCESS_PROHIBITED
+    Properties:
+      FunctionName: !Ref MemoryToolsFunction
+      Action: lambda:InvokeFunction
+      Principal: !Ref GatewayExecutionRoleArn
+
+  MemoryTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    # Same cfn-lint schema-lag suppression pattern as the websearch Connector
+    # target (bedrock-agentcore-gateway.yaml).
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3002
+            - E3003
+            - E3018
+    Properties:
+      # Plain-string GatewayIdentifier: a second target from a separate stack
+      # is supported by design (R9 F17) — the websearch template stays
+      # untouched (axiom A1).
+      GatewayIdentifier: !Ref GatewayIdentifier
+      Name: !Sub '${AWS::StackName}-memory'
+      Description: AgentCore Memory tools (user + org) — opt-in, content-bearing (A3)
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      # F-008: No MetadataConfiguration is set because AgentCore rejects
+      # Authorization in AllowedRequestHeaders. DeployGate remains log-only.
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt MemoryToolsFunction.Arn
+            ToolSchema:
+              # SECURITY INVARIANT (ADR-0016): no tool takes an actor_id /
+              # user identifier argument. Identity is derived server-side
+              # from the gateway-validated JWT only.
+              InlinePayload:
+                - !If
+                  - HasUserMemory
+                  - Name: memory_store
+                    Description: >-
+                      Save a durable fact or preference for the current user.
+                      The user identity is derived server-side from the
+                      authenticated session.
+                    InputSchema:
+                      Type: object
+                      Properties:
+                        content:
+                          Type: string
+                          Description: The fact or preference to remember.
+                      Required:
+                        - content
+                  - !Ref 'AWS::NoValue'
+                - !If
+                  - HasUserMemory
+                  - Name: memory_retrieve
+                    Description: >-
+                      Semantic search over the current user's stored memories
+                      (facts and preferences). The user identity is derived
+                      server-side from the authenticated session.
+                    InputSchema:
+                      Type: object
+                      Properties:
+                        query:
+                          Type: string
+                          Description: What to search for.
+                        top_k:
+                          Type: integer
+                          Description: Maximum number of results (default 5).
+                      Required:
+                        - query
+                  - !Ref 'AWS::NoValue'
+                - !If
+                  - HasOrgMemory
+                  - Name: org_knowledge_search
+                    Description: Search shared organizational knowledge.
+                    InputSchema:
+                      Type: object
+                      Properties:
+                        query:
+                          Type: string
+                          Description: What to search for.
+                        top_k:
+                          Type: integer
+                          Description: Maximum number of results (default 5).
+                      Required:
+                        - query
+                  - !Ref 'AWS::NoValue'
+                - !If
+                  - HasOrgMemory
+                  - Name: org_knowledge_add
+                    Description: >-
+                      Publish curated knowledge to the shared organizational
+                      store (entitled groups only).
+                    InputSchema:
+                      Type: object
+                      Properties:
+                        content:
+                          Type: string
+                          Description: The knowledge to publish.
+                        title:
+                          Type: string
+                          Description: Optional short title.
+                      Required:
+                        - content
+                  - !Ref 'AWS::NoValue'
+
+  # ============================================
+  # Sweeper (extracted-only mode): T+24h purge
+  # ============================================
+
+  # Kinesis MemoryRecordCreated events do not reference the source raw event,
+  # so delete-after-extraction cannot be correlated (R9 F14). v1 is a daily
+  # scheduled purge of events older than the extraction window (R9 verdict).
+  MemorySweeperRole:
+    Type: AWS::IAM::Role
+    Condition: IsExtractedOnly
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Single-purpose policy scoped to this role and this memory store
+          # only - converting to a managed policy adds no security.
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: memory-sweeper
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Event APIs are actor/session-scoped (no namespace condition
+              # key documented for them — R9 F15); scoped to this memory ARN.
+              - Sid: PurgeRawEvents
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:ListActors
+                  - bedrock-agentcore:ListSessions
+                  - bedrock-agentcore:ListEvents
+                  - bedrock-agentcore:DeleteEvent
+                Resource: !GetAtt ToolsMemory.MemoryArn
+              # Failed async (EventBridge) invocations land in the DLQ
+              - Sid: DeadLetterDelivery
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt MemorySweeperDLQ.Arn
+
+  MemorySweeperFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsExtractedOnly
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Scheduled maintenance job; talks only to the bedrock-agentcore data plane"
+          - id: W92
+            reason: "One scheduled invocation per day — reserved concurrency unnecessary"
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-memory-sweeper'
+      Description: Daily purge of raw memory events older than the extraction window (extracted-only mode, ADR-0012 D4)
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt MemorySweeperRole.Arn
+      Timeout: 900
+      MemorySize: 256
+      DeadLetterConfig:
+        TargetArn: !GetAtt MemorySweeperDLQ.Arn
+      Environment:
+        Variables:
+          MEMORY_ID: !GetAtt ToolsMemory.MemoryId
+          PURGE_AGE_HOURS: '24'
+      Code: ./lambda-functions/memory_sweeper/
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-memory-sweeper'
+        - Key: Purpose
+          Value: extracted-only raw-event purge at T+24h
+
+  # DLQ for failed async (EventBridge-scheduled) sweeper invocations
+  MemorySweeperDLQ:
+    Type: AWS::SQS::Queue
+    Condition: IsExtractedOnly
+    Properties:
+      # AWS-managed SQS key, not MemoryKmsKey: that key is conditional on
+      # CreateKmsKey while this queue is conditional on IsExtractedOnly. The
+      # Lambda service writes with the execution role, which the aws/sqs key
+      # policy already covers for this account.
+      KmsMasterKeyId: alias/aws/sqs
+      MessageRetentionPeriod: 1209600
+
+  MemorySweeperSchedule:
+    Type: AWS::Events::Rule
+    Condition: IsExtractedOnly
+    Properties:
+      Description: Daily raw-event purge for the AgentCore memory store (extracted-only mode)
+      ScheduleExpression: 'rate(1 day)'
+      State: ENABLED
+      Targets:
+        - Id: memory-sweeper
+          Arn: !GetAtt MemorySweeperFunction.Arn
+
+  MemorySweeperSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: IsExtractedOnly
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Scanner misread (rule engine type error: "PathAwareValues are not
+          # comparable String, int"). The events.amazonaws.com grant is
+          # already confused-deputy-safe: SourceArn below scopes it to this
+          # stack's schedule rule only.
+          - LAMBDA_FUNCTION_PUBLIC_ACCESS_PROHIBITED
+    Properties:
+      FunctionName: !Ref MemorySweeperFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MemorySweeperSchedule.Arn
+
+  # ============================================
+  # Fail-visible alarms (axiom A5)
+  # ============================================
+
+  MemoryToolsErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-tools-errors'
+      AlarmDescription: memory-tools Lambda is failing — memory tool calls through the gateway are erroring
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref MemoryToolsFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  MemorySweeperErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsExtractedOnly
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-sweeper-errors'
+      AlarmDescription: memory sweeper Lambda is failing — raw events may outlive the extracted-only window (bounded by the 3-day EventExpiryDuration backstop)
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref MemorySweeperFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  # Fail-visible (A5): if the schedule stops firing the purge silently stops.
+  # Missing data breaches so a disabled/broken rule raises the alarm.
+  MemorySweeperNotRunningAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsExtractedOnly
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-sweeper-not-running'
+      AlarmDescription: memory sweeper has not run in 24h — the extracted-only purge is not happening (3-day EventExpiryDuration is the backstop)
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref MemorySweeperFunction
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+Outputs:
+  MemoryId:
+    Description: Identifier of the AgentCore Memory resource (used by 'gip memory' commands).
+    Value: !GetAtt ToolsMemory.MemoryId
+    Export:
+      Name: !Sub '${AWS::StackName}-MemoryId'
+
+  MemoryArn:
+    Description: ARN of the AgentCore Memory resource.
+    Value: !GetAtt ToolsMemory.MemoryArn
+
+  MemoryTargetRef:
+    Description: Composite '<gatewayId>|<targetId>' reference of the memory gateway target.
+    Value: !Ref MemoryTarget
+
+  MemoryToolsFunctionArn:
+    Description: ARN of the memory-tools Lambda.
+    Value: !GetAtt MemoryToolsFunction.Arn
+
+  MemoryModeValue:
+    Description: Memory mode this stack was deployed with (extracted-only or full).
+    Value: !Ref MemoryMode
+
+  DeployGateValue:
+    Description: actorId-binding verification gate state (log-only or active). See ADR-0016.
+    Value: !Ref DeployGate
+
+  EffectiveKmsKeyArn:
+    Description: KMS key encrypting the memory store (supplied or stack-managed CMK).
+    Value: !If [HasKmsKey, !Ref KmsKeyArn, !GetAtt MemoryKmsKey.Arn]
+
+  SweeperFunctionName:
+    Condition: IsExtractedOnly
+    Description: Name of the raw-event sweeper Lambda (extracted-only mode only).
+    Value: !Ref MemorySweeperFunction

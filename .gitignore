@@ -1,0 +1,99 @@
+.DS_Store
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+*.spec
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
+
+# AWS credentials (safety)
+.aws/credentials
+.aws/config
+
+# Local environment files
+.env
+.env.local
+
+# Claude Code settings (rules are tracked)
+# .claude/ directory should be committed
+
+#Claude Code plugin settings
+.claude-plugin
+
+# Kiro settings (contains tokens)
+.kiro/settings/mcp.json
+
+# Local documentation and feedback
+FEEDBACK.md
+
+# Temporary test files
+output.json
+*.bak
+# Local POC test scripts at repo root only -- not source/tests/test_*.py
+/test_*.py
+
+
+guidance-docs/
+parameters.json
+
+# ccwb deployment config
+source/.ccwb-config/
+
+guidance-submission/
+tests/
+!tests/e2e/
+!tests/e2e/**
+!source/tests/
+!source/tests/**
+source/tests/**/__pycache__/
+tests/e2e/artifacts/
+assets/docs/planning
+
+.pytest_cache/
+.ruff_cache/
+.coverage
+.epcc
+
+EPCC_*
+PRs/
+test_cognito_detection.py
+
+# Development documentation (not for production)
+TESTING_*.md
+IMPLEMENTATION_SUMMARY.md
+PARTITION_*.md
+FEEDBACK.md
+.claudeignore
+.mcp.json
+source/go/credential-process
+/source/go/*.exe
+site/
+coverage.json
+
+# Upstream Claude Apps Gateway subtrees are not tracked (ADR-0036). They are
+# materialized at the commit pinned in vendor/aws-samples/anthropic-on-aws/UPSTREAM.json
+# by scripts/fetch-claude-apps-gateway.sh, which verifies tree ids and SHA-256 manifests.
+vendor/aws-samples/anthropic-on-aws/claude-apps-gateway/
+vendor/aws-samples/anthropic-on-aws/claude-apps-gateway-bootstrap/

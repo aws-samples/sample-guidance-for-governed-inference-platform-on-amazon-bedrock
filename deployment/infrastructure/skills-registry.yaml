@@ -1,0 +1,963 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Governed skills registry for Governed Inference Platform on Amazon Bedrock: versioned S3 review
+  sources (skills/<name>/<version>/) and content-addressed approved artifacts
+  (approved/sha256/<digest>/ plus approved/sha256/<digest>.zip) + AWS Agent Registry
+  as the governance source of truth, with
+  publisher/curator personas, EventBridge approval notification, and a
+  distributor Lambda that renders marketplace.json for Claude Code and
+  skills-lock.json for `gip skills sync`. A dormant plugins-registry.json
+  compatibility output remains for legacy raw-CloudFormation consumers only.
+  NOTE - no CloudFormation type exists for the registry (verified 2026-07-08
+  preview, re-verified 2026-08-12 GA); the registry is provisioned by a
+  Lambda-backed custom resource. All registry API calls are isolated in
+  lambda-functions/skills_registry/registry_client.py; the API surface
+  (preview bedrock-agentcore vs GA agent-registry) is selected by the
+  AgentRegistryApiSurface parameter (preview endpoints shut down 2026-09-17).
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Registry"
+        Parameters:
+          - RegistryName
+          - RetainRegistryOnDelete
+          - AgentRegistryApiSurface
+      - Label:
+          default: "Access control"
+        Parameters:
+          - OrganizationId
+          - PublisherGroups
+          - CuratorGroups
+      - Label:
+          default: "Legacy plugin-index compatibility"
+        Parameters:
+          - PluginsS3Bucket
+    ParameterLabels:
+      RegistryName:
+        default: "Registry name"
+      RetainRegistryOnDelete:
+        default: "Keep registry on stack delete"
+      AgentRegistryApiSurface:
+        default: "Agent Registry API surface (GA vs preview)"
+      OrganizationId:
+        default: "AWS Organizations ID (optional)"
+      PublisherGroups:
+        default: "Publisher IdP groups (optional)"
+      CuratorGroups:
+        default: "Curator IdP groups (optional)"
+      PluginsS3Bucket:
+        default: "Legacy plugin-index bucket name (optional)"
+
+Parameters:
+  RegistryName:
+    Type: String
+    Default: gip-skills
+    Description: >-
+      Name of the Agent Registry to create or adopt. If a registry with this
+      name already exists in the account/region it is adopted (not recreated).
+
+  OrganizationId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^o-[a-z0-9]{10,32}$'
+    Description: >-
+      Optional AWS Organizations ID (o-xxxxxxxxxx). When set, the artifact
+      bucket policy grants read-only access to approved/ and distribution/
+      objects to every principal in the organization via
+      aws:PrincipalOrgID - the cross-account exposure option. Leave empty to
+      keep the bucket single-account (default: off).
+
+  PluginsS3Bucket:
+    Type: String
+    Default: ''
+    Description: >-
+      Legacy compatibility only; new GIP deployments leave this empty. When
+      explicitly set by an older raw-CloudFormation deployment, the distributor
+      continues writing plugins-registry.json. Claude Desktop deployments use
+      the pinned AWS Samples filesystem/MDM contract instead.
+
+  PublisherGroups:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >-
+      Optional. IdP group names allowed to assume the PublisherRole. Gating
+      uses the aws:PrincipalTag/groups session tag carried by the existing
+      IdP federation (same group-list parameter pattern as the gateway
+      lane's EntitledGroups). Requires the federated session to map the IdP
+      groups claim to a 'groups' principal tag; multi-group claims arrive as
+      a single comma-joined tag value, so exact-match gating works best with
+      a dedicated single-value claim. Empty = role assumable only via
+      explicit IAM policy (account-root trust).
+
+  CuratorGroups:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >-
+      Optional. IdP group names allowed to assume the CuratorRole (approve /
+      reject skill records). Same mechanism and caveats as PublisherGroups.
+
+  RetainRegistryOnDelete:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether to keep the Agent Registry (and its approval state) when the
+      stack is deleted. Default true because approval state lives only in
+      the registry; artifacts and skill sources remain in S3/git. Manual
+      cleanup - delete the registry with the CLI after exporting approvals.
+
+  AgentRegistryApiSurface:
+    Type: String
+    Default: ga-2026-08-06
+    AllowedValues: ['preview-2026-07-08', 'ga-2026-08-06']
+    Description: >-
+      Pinned Agent Registry API surface for both Lambdas (exported as
+      GIP_AGENT_REGISTRY_API_SURFACE). Default is the GA agent-registry
+      namespace (launched 2026-08-06). Set preview-2026-07-08 only as a
+      temporary fallback while migrating registry data; preview endpoints
+      shut down 2026-09-17. Runbook -
+      assets/docs/adr/0029-agent-registry-api-migration.md.
+
+  AlertTopicArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Existing SNS topic ARN to reuse for pending-approval notifications.
+      Leave empty to create the dedicated pending-approval topic, encrypted
+      with this stack's KMS key (CuratorTopicKey, which also encrypts the
+      distributor dead-letter queue and exists regardless of this parameter).
+      NOTE: when reusing an external topic, its access policy (and KMS key
+      policy, if encrypted) must allow events.amazonaws.com to Publish or the
+      pending-approval rule cannot deliver.
+
+Conditions:
+  IsOrg: !Not [!Equals [!Ref OrganizationId, '']]
+  CreateTopic: !Equals [!Ref AlertTopicArn, '']
+  HasPluginsBucket: !Not [!Equals [!Ref PluginsS3Bucket, '']]
+  HasPublisherGroups: !Not [!Equals [!Join ['', !Ref PublisherGroups], '']]
+  HasCuratorGroups: !Not [!Equals [!Join ['', !Ref CuratorGroups], '']]
+  UsesGaSurface: !Equals [!Ref AgentRegistryApiSurface, 'ga-2026-08-06']
+
+Resources:
+  # ============================================================
+  # Artifact store: create-only review sources + content-addressed approvals
+  # ============================================================
+
+  # Access-log bucket (same pattern as codebuild-windows.yaml LoggingBucket)
+  SkillsLoggingBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: 'Dedicated server-access-log destination. AWS Security Hub control S3.9: "The target logging bucket does not need to have server access logging enabled, and you should suppress findings for this bucket." Logging a log bucket to itself is documented by AWS as an infinite loop and not recommended (S3 User Guide, enable-server-access-logging).'
+      guard:
+        SuppressedRules:
+          # Log destination bucket: self-logging would recurse. Object Lock is
+          # irreversible and lifecycle expiry manages retention. No ACL is
+          # configured (private default) and public access is fully blocked.
+          - S3_BUCKET_LOGGING_ENABLED
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 90
+      Tags:
+        - Key: Application
+          Value: GovernedInferencePlatform
+        - Key: Purpose
+          Value: AccessLogs
+
+  SkillsLoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SkillsLoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt SkillsLoggingBucket.Arn
+              - !Sub '${SkillsLoggingBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+          # S3 server access log delivery (SkillsArtifactBucket LoggingConfiguration)
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${SkillsLoggingBucket.Arn}/skills-artifacts/*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+              ArnLike:
+                aws:SourceArn: !GetAtt SkillsArtifactBucket.Arn
+
+  # SSE-S3 (AES256), not SSE-KMS: the optional aws:PrincipalOrgID read grant
+  # must work cross-account, and the AWS-managed KMS key (aws/s3) cannot be
+  # used by other accounts. AES256 also matches every other bucket in this
+  # repo. A customer-managed key with an org-wide key policy is the upgrade
+  # path if KMS is required (see assets/docs/SKILLS_REGISTRY.md).
+  SkillsArtifactBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Object Lock is irreversible and wrong for a mutable artifact
+          # bucket (create-only semantics are enforced in the bucket policy);
+          # no ACL is configured (private default) and public access is
+          # fully blocked.
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref SkillsLoggingBucket
+        LogFilePrefix: skills-artifacts/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Application
+          Value: GovernedInferencePlatform
+        - Key: Purpose
+          Value: SkillsArtifacts
+
+  SkillsArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SkillsArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt SkillsArtifactBucket.Arn
+              - !Sub '${SkillsArtifactBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+          # PutObject with If-None-Match:* is the only approved-artifact write
+          # path. This makes create-only semantics an IAM boundary, not merely
+          # a distributor implementation detail.
+          - Sid: DenyUnconditionalApprovedWrites
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub '${SkillsArtifactBucket.Arn}/approved/*'
+            Condition:
+              'Null':
+                's3:if-none-match': 'true'
+          # A delete marker would make If-None-Match succeed again on the same
+          # canonical key. Deny both current-version and version deletion so an
+          # approved digest remains immutable at the bucket-policy boundary.
+          - Sid: DenyApprovedArtifactDeletion
+            Effect: Deny
+            Principal: '*'
+            Action:
+              - 's3:DeleteObject'
+              - 's3:DeleteObjectVersion'
+            Resource: !Sub '${SkillsArtifactBucket.Arn}/approved/*'
+          # Publishers may safely resume partial uploads, but can never replace
+          # an existing canonical ZIP or review-directory object.
+          - Sid: DenyUnconditionalReviewSourceWrites
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub '${SkillsArtifactBucket.Arn}/skills/*'
+            Condition:
+              'Null':
+                's3:if-none-match': 'true'
+          - !If
+            - IsOrg
+            - Sid: OrgWideApprovedRead
+              Effect: Allow
+              Principal: '*'
+              Action:
+                - 's3:GetObject'
+                - 's3:GetObjectVersion'
+              Resource:
+                - !Sub '${SkillsArtifactBucket.Arn}/approved/*'
+                - !Sub '${SkillsArtifactBucket.Arn}/distribution/*'
+              Condition:
+                StringEquals:
+                  'aws:PrincipalOrgID': !Ref OrganizationId
+            - !Ref 'AWS::NoValue'
+          - !If
+            - IsOrg
+            - Sid: OrgWideApprovedList
+              Effect: Allow
+              Principal: '*'
+              Action: 's3:ListBucket'
+              Resource: !GetAtt SkillsArtifactBucket.Arn
+              Condition:
+                StringEquals:
+                  'aws:PrincipalOrgID': !Ref OrganizationId
+                StringLike:
+                  's3:prefix':
+                    - 'approved/*'
+                    - 'distribution/*'
+            - !Ref 'AWS::NoValue'
+
+  # ============================================================
+  # Agent Registry (Lambda-backed custom resource - no CFN type exists)
+  # ============================================================
+
+  RegistryProvisionerRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Single-purpose policy scoped to this role only - converting to a
+          # managed policy adds no security.
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: RegistryProvisioning
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Registry control plane. Both namespaces are granted (dual
+              # grants) because the AgentRegistryApiSurface parameter can
+              # select either surface until the preview endpoints shut down
+              # on 2026-09-17 (ADR-0029 day-one execution 2026-08-12);
+              # remove the bedrock-agentcore grants after that date.
+              # CreateRegistry/ListRegistries do not support a registry
+              # resource type. The execution role is account-local and the
+              # requested-region condition limits the wildcard to this stack's
+              # region. See the Agent Registry service authorization reference.
+              - Sid: RegistryCollectionLifecycle
+                Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:CreateRegistry'
+                  - 'bedrock-agentcore:ListRegistries'
+                  - 'agent-registry:CreateRegistry'
+                  - 'agent-registry:ListRegistries'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'aws:RequestedRegion': !Ref 'AWS::Region'
+              - Sid: RegistryLifecycle
+                Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:GetRegistry'
+                  - 'bedrock-agentcore:UpdateRegistry'
+                  - 'bedrock-agentcore:DeleteRegistry'
+                  - 'agent-registry:GetRegistry'
+                  - 'agent-registry:UpdateRegistry'
+                  - 'agent-registry:DeleteRegistry'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:registry/*'
+                  - !Sub 'arn:${AWS::Partition}:agent-registry:${AWS::Region}:${AWS::AccountId}:registry/*'
+              # Registry lifecycle creates an AgentCore workload identity.
+              # These permissions are service prerequisites and must also
+              # cover idempotent create retries and registry deletion.
+              - Sid: RegistryWorkloadIdentityLifecycle
+                Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:CreateWorkloadIdentity'
+                  - 'bedrock-agentcore:GetWorkloadIdentity'
+                  - 'bedrock-agentcore:DeleteWorkloadIdentity'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'aws:RequestedRegion': !Ref 'AWS::Region'
+              - Sid: CreateAgentRegistryServiceLinkedRole
+                Effect: Allow
+                Action: 'iam:CreateServiceLinkedRole'
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/agent-registry.amazonaws.com/AWSServiceRoleForAgentRegistry'
+                Condition:
+                  StringEquals:
+                    'iam:AWSServiceName': agent-registry.amazonaws.com
+        - PolicyName: ProvisionerLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-registry-provisioner'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-registry-provisioner:*'
+
+  RegistryProvisionerFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "CloudFormation custom resource calling the Agent Registry API only — VPC adds NAT cost for customers"
+          - id: W92
+            reason: "Custom resource invoked once per stack operation — reserved concurrency unnecessary"
+      guard:
+        SuppressedRules:
+          - LAMBDA_INSIDE_VPC
+          - LAMBDA_CONCURRENCY_CHECK
+          # Custom resource: failures surface as stack events/rollback via
+          # cfnresponse - a DLQ has no consumer and adds no recovery path.
+          - LAMBDA_DLQ_CHECK
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-registry-provisioner'
+      Description: >-
+        Custom resource - creates or adopts the Agent Registry. All registry
+        API calls live in registry_client.py (namespace-migration isolation).
+      Runtime: python3.12
+      Handler: index.handler
+      Architectures:
+        - arm64
+      Role: !GetAtt RegistryProvisionerRole.Arn
+      # F-009: Fresh-account registry provisioning can require the full
+      # five-minute service readiness wait.
+      Timeout: 360
+      MemorySize: 256
+      Environment:
+        Variables:
+          GIP_AGENT_REGISTRY_API_SURFACE: !Ref AgentRegistryApiSurface
+      Code: ./lambda-functions/skills_registry/
+
+  SkillsRegistry:
+    Type: Custom::AgentRegistry
+    Properties:
+      ServiceToken: !GetAtt RegistryProvisionerFunction.Arn
+      Name: !Ref RegistryName
+      Description: Governed skills registry for Governed Inference Platform on Amazon Bedrock (gip)
+      # Governance registry is IAM-mode; a JWT discovery registry is a
+      # deliberate follow-up behind a flag (R13: deferred pending live test).
+      AuthorizerType: AWS_IAM
+      RetainOnDelete: !Ref RetainRegistryOnDelete
+
+  # ============================================================
+  # Personas: publisher / curator (registry-prerequisites persona policies)
+  # ============================================================
+
+  # Both roles trust the account root: callers must ALSO hold sts:AssumeRole
+  # in their identity policy (secure default). When *Groups is set, the trust
+  # additionally requires the caller's federated session to carry a matching
+  # aws:PrincipalTag/groups tag - the same IdP-group list parameter pattern
+  # the gateway lane uses (EntitledGroups), applied at the IAM boundary.
+  PublisherRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Single-purpose policy scoped to this role only - converting to a
+          # managed policy adds no security.
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-publisher'
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'sts:AssumeRole'
+            Condition: !If
+              - HasPublisherGroups
+              - StringEquals:
+                  'aws:PrincipalTag/groups': !Ref PublisherGroups
+              - !Ref 'AWS::NoValue'
+      Policies:
+        - PolicyName: SkillsPublisher
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Publishers create and submit records but cannot mutate a
+              # reviewed record after submission or approve it. Dual-namespace
+              # grants until preview shutdown 2026-09-17 (ADR-0029).
+              - Sid: PublishRecords
+                Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:CreateRegistryRecord'
+                  - 'bedrock-agentcore:GetRegistryRecord'
+                  - 'bedrock-agentcore:ListRegistryRecords'
+                  - 'bedrock-agentcore:SubmitRegistryRecordForApproval'
+                  - 'agent-registry:CreateRegistryRecord'
+                  - 'agent-registry:GetRegistryRecord'
+                  - 'agent-registry:ListRegistryRecords'
+                  - 'agent-registry:SubmitRegistryRecordForApproval'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:registry/${SkillsRegistry.RegistryId}'
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:registry/${SkillsRegistry.RegistryId}/record/*'
+                  - !Sub 'arn:${AWS::Partition}:agent-registry:${AWS::Region}:${AWS::AccountId}:registry/${SkillsRegistry.RegistryId}'
+                  - !Sub 'arn:${AWS::Partition}:agent-registry:${AWS::Region}:${AWS::AccountId}:registry/${SkillsRegistry.RegistryId}/record/*'
+              - Sid: UploadArtifacts
+                Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                Resource: !Sub '${SkillsArtifactBucket.Arn}/skills/*'
+              - Sid: ListArtifacts
+                Effect: Allow
+                Action: 's3:ListBucket'
+                Resource: !GetAtt SkillsArtifactBucket.Arn
+                Condition:
+                  StringLike:
+                    's3:prefix': 'skills/*'
+
+  CuratorRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Single-purpose policy scoped to this role only - converting to a
+          # managed policy adds no security.
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-curator'
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'sts:AssumeRole'
+            Condition: !If
+              - HasCuratorGroups
+              - StringEquals:
+                  'aws:PrincipalTag/groups': !Ref CuratorGroups
+              - !Ref 'AWS::NoValue'
+      Policies:
+        - PolicyName: SkillsCurator
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Curators can review records, but decisions are mediated by the
+              # distributor so promotion and immutable metadata precede approval.
+              # Dual-namespace grants until preview shutdown 2026-09-17 (ADR-0029).
+              - Sid: ReviewRecords
+                Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:GetRegistryRecord'
+                  - 'bedrock-agentcore:ListRegistryRecords'
+                  - 'agent-registry:GetRegistryRecord'
+                  - 'agent-registry:ListRegistryRecords'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:registry/${SkillsRegistry.RegistryId}'
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:registry/${SkillsRegistry.RegistryId}/record/*'
+                  - !Sub 'arn:${AWS::Partition}:agent-registry:${AWS::Region}:${AWS::AccountId}:registry/${SkillsRegistry.RegistryId}'
+                  - !Sub 'arn:${AWS::Partition}:agent-registry:${AWS::Region}:${AWS::AccountId}:registry/${SkillsRegistry.RegistryId}/record/*'
+              # `gip skills approve` invokes this workflow synchronously. The
+              # role intentionally has no direct registry status permission.
+              - Sid: TriggerApprovalWorkflow
+                Effect: Allow
+                Action: 'lambda:InvokeFunction'
+                Resource: !GetAtt DistributorFunction.Arn
+
+  # ============================================================
+  # Approval workflow wiring (EventBridge -> SNS)
+  # ============================================================
+
+  # Stack CMK shared by the pending-approval topic (when created) and the
+  # distributor dead-letter queue (always). Both have EventBridge as a
+  # publisher, and the AWS-managed aws/sns / aws/sqs keys cannot grant
+  # events.amazonaws.com (immutable key policies). Unconditional because the
+  # queue exists regardless of AlertTopicArn. The EventBridge grant carries
+  # no aws:Source* condition (SNS documents them as unsupported for this
+  # grant); confused-deputy scoping lives on the topic policy and the queue
+  # policy (aws:SourceArn / aws:SourceAccount). The root statement delegates
+  # use to IAM for DistributorRole. The existing CuratorTopicKey logical ID
+  # and alias are retained so upgrading a stack does not replace its key.
+  CuratorTopicKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'CMK for the ${AWS::StackName} pending-approval topic and distributor dead-letter queue'
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          # SNS itself, bound to this topic via the encryption context
+          # (sns-enable-encryption-for-topic, "Permissions for custom KMS keys").
+          - Sid: SnsServiceUse
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - 'kms:GenerateDataKey'
+              - 'kms:Decrypt'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:EncryptionContext:aws:sns:topicArn': !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-pending-approval'
+          # PendingApprovalRule (EventBridge). Deliberately no aws:Source*
+          # condition: the SNS Developer Guide states aws:SourceAccount /
+          # aws:SourceArn / aws:SourceOrgID are not supported for
+          # EventBridge-to-encrypted-topic delivery. The confused-deputy
+          # control is CuratorTopicPolicy, which limits sns:Publish to this
+          # rule's ARN.
+          - Sid: EventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - 'kms:GenerateDataKey*'
+              - 'kms:Decrypt'
+            Resource: '*'
+
+  CuratorTopicKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-pending-approval'
+      TargetKeyId: !Ref CuratorTopicKey
+
+  # TopicName is unchanged from the unencrypted version so existing
+  # subscriptions survive the update (KmsMasterKeyId updates without
+  # interruption).
+  CuratorTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateTopic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-pending-approval'
+      DisplayName: gip skills pending approval
+      KmsMasterKeyId: !Ref CuratorTopicKey
+
+  CuratorTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: CreateTopic
+    Properties:
+      Topics:
+        - !Ref CuratorTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sns:Publish'
+            Resource: !Ref CuratorTopic
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !GetAtt PendingApprovalRule.Arn
+
+  # The only documented registry event (registry-key-capabilities, retrieved
+  # 2026-07-08). No Approved/Rejected event exists, so distribution is
+  # schedule-driven plus synchronous invoke from `gip skills approve`.
+  # Both event sources are matched so the rule works on either API surface
+  # until the preview namespace shuts down 2026-09-17 (ADR-0029).
+  PendingApprovalRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-pending-approval'
+      Description: Notify curators when a skill record is submitted for approval
+      EventPattern:
+        source:
+          - aws.bedrock-agentcore
+          - aws.agent-registry
+        detail-type:
+          - 'Registry Record State changed to Pending Approval'
+      State: ENABLED
+      Targets:
+        - Arn: !If [CreateTopic, !Ref CuratorTopic, !Ref AlertTopicArn]
+          Id: notify-curators
+
+  # ============================================================
+  # Distributor: APPROVED records -> per-harness outputs
+  # ============================================================
+
+  # Two writers: the Lambda service (DistributorRole, on failed async
+  # invocations) and EventBridge (DistributorSchedule target DLQ). The
+  # second needs a customer-managed key with an events.amazonaws.com grant,
+  # so the stack CMK is used rather than aws/sqs. On UPDATE the queue is
+  # re-encrypted before DistributorRole gains its key grant (the role's
+  # inline policy references the queue ARN, so CloudFormation must update the
+  # queue first; ordering the other way round is a dependency cycle). The
+  # window is one PutRolePolicy (seconds); a Lambda failure whose DLQ write
+  # lands inside it is reported as DeadLetterErrors and re-rendered by the
+  # next 15-minute run.
+  DistributorDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: !Ref CuratorTopicKey
+      MessageRetentionPeriod: 1209600
+
+  DistributorRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Single-purpose policy scoped to this role only - converting to a
+          # managed policy adds no security.
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: DistributorRegistryWorkflow
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Dual-namespace grants until preview shutdown 2026-09-17
+              # (ADR-0029 day-one execution 2026-08-12).
+              - Sid: ReadAndDecideRecords
+                Effect: Allow
+                Action:
+                  - 'bedrock-agentcore:ListRegistryRecords'
+                  - 'bedrock-agentcore:GetRegistryRecord'
+                  - 'bedrock-agentcore:UpdateRegistryRecord'
+                  - 'bedrock-agentcore:SubmitRegistryRecordForApproval'
+                  - 'bedrock-agentcore:UpdateRegistryRecordStatus'
+                  - 'agent-registry:ListRegistryRecords'
+                  - 'agent-registry:GetRegistryRecord'
+                  - 'agent-registry:UpdateRegistryRecord'
+                  - 'agent-registry:SubmitRegistryRecordForApproval'
+                  - 'agent-registry:UpdateRegistryRecordStatus'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:registry/${SkillsRegistry.RegistryId}'
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:registry/${SkillsRegistry.RegistryId}/record/*'
+                  - !Sub 'arn:${AWS::Partition}:agent-registry:${AWS::Region}:${AWS::AccountId}:registry/${SkillsRegistry.RegistryId}'
+                  - !Sub 'arn:${AWS::Partition}:agent-registry:${AWS::Region}:${AWS::AccountId}:registry/${SkillsRegistry.RegistryId}/record/*'
+        - PolicyName: DistributorArtifactPromotion
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadReviewSourceVersions
+                Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                Resource: !Sub '${SkillsArtifactBucket.Arn}/skills/*'
+              - Sid: ListReviewSourceDirectory
+                Effect: Allow
+                Action: 's3:ListBucket'
+                Resource: !GetAtt SkillsArtifactBucket.Arn
+                Condition:
+                  StringLike:
+                    's3:prefix': 'skills/*'
+              - Sid: ListReviewSourceVersions
+                Effect: Allow
+                Action: 's3:ListBucketVersions'
+                Resource: !GetAtt SkillsArtifactBucket.Arn
+                Condition:
+                  StringLike:
+                    's3:prefix': 'skills/*'
+              - Sid: ListApprovedDirectory
+                Effect: Allow
+                Action: 's3:ListBucket'
+                Resource: !GetAtt SkillsArtifactBucket.Arn
+                Condition:
+                  StringLike:
+                    's3:prefix': 'approved/sha256/*'
+              - Sid: PromoteApprovedArtifacts
+                Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                Resource: !Sub '${SkillsArtifactBucket.Arn}/approved/sha256/*'
+        - PolicyName: DistributorWrites
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteDistributionOutputs
+                Effect: Allow
+                Action: 's3:PutObject'
+                Resource: !Sub '${SkillsArtifactBucket.Arn}/distribution/*'
+              - !If
+                - HasPluginsBucket
+                - Sid: WritePluginsRegistry
+                  Effect: Allow
+                  Action: 's3:PutObject'
+                  Resource: !Sub 'arn:${AWS::Partition}:s3:::${PluginsS3Bucket}/plugins-registry.json'
+                - !Ref 'AWS::NoValue'
+              - Sid: DeliverFailedAsyncInvocations
+                Effect: Allow
+                Action: 'sqs:SendMessage'
+                Resource: !GetAtt DistributorDeadLetterQueue.Arn
+              # SSE-KMS on the DLQ: the Lambda service sends with this role.
+              - Sid: UseDeadLetterQueueKey
+                Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                Resource: !GetAtt CuratorTopicKey.Arn
+        - PolicyName: DistributorLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-distributor'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-distributor:*'
+
+  DistributorFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Calls S3 and Agent Registry AWS APIs only, no VPC resources — VPC adds NAT cost for customers"
+      guard:
+        SuppressedRules:
+          - LAMBDA_INSIDE_VPC
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-distributor'
+      Description: >-
+        Mediates skill decisions, promotes verified bytes to content-addressed
+        directory and ZIP artifacts before approval, and renders CoWork, Claude
+        Code, and gip sync outputs. Failures preserve the prior consumer lock.
+      Runtime: python3.12
+      Handler: distributor.handler
+      Architectures:
+        - arm64
+      Role: !GetAtt DistributorRole.Arn
+      Timeout: 300
+      ReservedConcurrentExecutions: 1
+      MemorySize: 256
+      DeadLetterConfig:
+        TargetArn: !GetAtt DistributorDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          REGISTRY_ID: !GetAtt SkillsRegistry.RegistryId
+          ARTIFACT_BUCKET: !Ref SkillsArtifactBucket
+          GIP_AGENT_REGISTRY_API_SURFACE: !Ref AgentRegistryApiSurface
+          # Legacy plugin-index compatibility only. New Desktop deployments use
+          # the pinned AWS Samples filesystem/MDM delivery contract.
+          PLUGINS_S3_BUCKET: !Ref PluginsS3Bucket
+          PLUGINS_S3_KEY: plugins-registry.json
+          MARKETPLACE_S3_KEY: distribution/marketplace.json
+          SKILLS_LOCK_S3_KEY: distribution/skills-lock.json
+      Code: ./lambda-functions/skills_registry/
+
+  DistributorSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-distributor-schedule'
+      Description: Periodic re-render of distribution outputs from APPROVED records
+      ScheduleExpression: 'rate(15 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DistributorFunction.Arn
+          Id: distributor
+          DeadLetterConfig:
+            Arn: !GetAtt DistributorDeadLetterQueue.Arn
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 3600
+            MaximumRetryAttempts: 2
+
+  DistributorDeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref DistributorDeadLetterQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowScheduledDistributionFailures
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sqs:SendMessage'
+            Resource: !GetAtt DistributorDeadLetterQueue.Arn
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !GetAtt DistributorSchedule.Arn
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  DistributorSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DistributorFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DistributorSchedule.Arn
+
+Outputs:
+  RegistryId:
+    Description: Agent Registry ID (created or adopted)
+    Value: !GetAtt SkillsRegistry.RegistryId
+    Export:
+      Name: !Sub '${AWS::StackName}-RegistryId'
+  RegistryArn:
+    Description: Agent Registry ARN (namespace follows the selected API surface)
+    Value: !If
+      - UsesGaSurface
+      - !Sub 'arn:${AWS::Partition}:agent-registry:${AWS::Region}:${AWS::AccountId}:registry/${SkillsRegistry.RegistryId}'
+      - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:registry/${SkillsRegistry.RegistryId}'
+    Export:
+      Name: !Sub '${AWS::StackName}-RegistryArn'
+  ArtifactBucket:
+    Description: Skills review sources and content-addressed approved directory and ZIP artifacts
+    Value: !Ref SkillsArtifactBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactBucket'
+  DistributorFunctionArn:
+    Description: Distributor Lambda ARN (invoked by gip skills approve)
+    Value: !GetAtt DistributorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributorFunctionArn'
+  PublisherRoleArn:
+    Description: Role for skill publishers (gip skills publish)
+    Value: !GetAtt PublisherRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PublisherRoleArn'
+  CuratorRoleArn:
+    Description: Role for skill curators (gip skills approve)
+    Value: !GetAtt CuratorRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CuratorRoleArn'
+  CuratorTopicArn:
+    Description: SNS topic notified on pending-approval events
+    Value: !If [CreateTopic, !Ref CuratorTopic, !Ref AlertTopicArn]
+    Export:
+      Name: !Sub '${AWS::StackName}-CuratorTopicArn'

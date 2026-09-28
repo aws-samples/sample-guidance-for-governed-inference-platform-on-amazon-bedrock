@@ -1,0 +1,1 @@
+../assets/docs/LIVE_VALIDATION.md

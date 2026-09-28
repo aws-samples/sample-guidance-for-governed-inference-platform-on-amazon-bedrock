@@ -1,0 +1,1 @@
+../assets/docs/SKILLS_REGISTRY.md

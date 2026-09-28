@@ -1,0 +1,516 @@
+# Windows installer end-to-end proof (standard user, native Windows)
+#
+# WHAT THIS CLOSES (when green): the single remaining blocker on Wave 4 track
+# Closes the standing gap: "run install.bat end-to-end under a
+# standard-user native Windows runner" — which also gates A6 and the
+# security review ("A3 installer transactions, native Windows proof").
+# 4 of the 5 guarded installer-transaction tests in
+# source/tests/cli/commands/test_windows_installer_transaction.py passed on
+# CodeBuild Windows; the 5th (install.bat end-to-end) is structurally
+# unrunnable there because CodeBuild executes as ContainerAdministrator and
+# gip-install.ps1 refuses to run the full installer as Administrator by design
+# ("Do not run the full installer as Administrator; managed settings elevate
+# separately"). This workflow builds the generated installer with stub
+# artifacts and executes install.bat as a freshly created STANDARD local user
+# on a GitHub-hosted windows-latest VM.
+#
+# MECHANISM (load-bearing) — run a process as a non-admin local user:
+#   1. GitHub-hosted Windows runners execute jobs as an Administrator with UAC
+#      disabled, so de-elevating in place is impossible; a real second user is
+#      required.
+#      https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+#      ("Windows virtual machines are configured to run as administrators with
+#      User Account Control (UAC) disabled") — retrieved 2026-07-29.
+#   2. New-LocalUser + Add-LocalGroupMember 'Users' creates the standard user.
+#   3. Start-Process -Credential <pscredential> starts the child under that
+#      user (CreateProcessWithLogonW). -LoadUserProfile loads its registry
+#      hive; -Environment (PowerShell 7.4+) overrides USERPROFILE/TEMP to a
+#      controlled home; -RedirectStandardInput/Output/Error capture exit code
+#      and output (the redirect handles are opened by this admin parent, so
+#      the child needs no extra ACLs).
+#      https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/start-process
+#      (ms.date 2026-07-06) — retrieved 2026-07-29.
+#   4. Run-as-a-different-user requires the Secondary Logon service
+#      (seclogon), started explicitly below.
+#      https://learn.microsoft.com/en-us/troubleshoot/windows-server/shell-experience/use-run-as-feature
+#      — retrieved 2026-07-29.
+#   Prior art / known pitfalls on hosted runners (why NOT runas or
+#   -Verb RunAsUser: runas prompts interactively; the RunAsUser shell verb
+#   swallows stdout/stderr and cannot be combined with redirection):
+#   https://stackoverflow.com/questions/70904273 (answers 2022-10-30/31) —
+#   retrieved 2026-07-29. If Start-Process -Credential ever fails on this
+#   image (e.g. window-station access in a service session), the probe step
+#   below fails fast; the documented fallbacks are a schtasks batch-logon task
+#   or PAExec (see the same Stack Overflow thread).
+#
+# WHAT THIS DOES NOT PROVE (still open after green):
+#   - No real IdP/OIDC/IDC auth flow: credential-process-windows.exe is a stub
+#     byte blob. No browser login, no STS, no quota check is exercised.
+#   - No OS keyring behavior: the stub never writes Windows Credential
+#     Manager entries, and CI logon sessions differ from interactive user
+#     sessions for DPAPI/keyring purposes (keyring chunking is covered by
+#     separate unit tests).
+#   - The elevated managed-settings path (-InstallManaged via
+#     Start-Process -Verb RunAs) is deliberately NOT packaged here: a standard
+#     user cannot answer a UAC consent prompt headlessly. Its pair-transaction
+#     logic remains covered only by unit tests.
+#   - USERPROFILE/TEMP are redirected to a controlled directory (same
+#     technique as the unit tests), not the user's natural C:\Users\<name>
+#     profile created at first interactive logon.
+#   - Claude Code itself is not installed: MCP registration, launcher usage,
+#     and 'claude' startup are not exercised.
+#   - The commit-phase rollback primitive (later Move fails after an earlier
+#     entry COMMITTED) stays covered by the transaction-library unit test; the
+#     end-to-end scenario here proves prepare-phase failure with restoration
+#     of already-quarantined owned files, which is the reachable mid-install
+#     failure through the real install.bat entry point.
+#
+# COST CONTROL: workflow_dispatch plus PRs that touch the installer generator,
+# its guarded tests, or this workflow. Never runs on plain pushes.
+
+name: Windows Installer E2E (standard user)
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    branches: ["main", "beta"]
+    paths:
+      - 'source/governed_inference_platform/cli/commands/package.py'
+      - 'source/tests/cli/commands/test_windows_installer_transaction.py'
+      - '.github/workflows/windows-installer-e2e.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  installer-e2e:
+    name: install.bat end-to-end as standard user
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install Poetry
+        run: pip install poetry
+
+      - name: Configure Poetry
+        run: poetry config virtualenvs.in-project true
+
+      - name: Cache Poetry virtualenv
+        uses: actions/cache@v6
+        with:
+          path: source/.venv
+          key: ${{ runner.os }}-poetry-3.12-${{ hashFiles('source/poetry.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-poetry-3.12-
+
+      - name: Install dependencies
+        working-directory: source
+        run: poetry install --no-interaction
+
+      # The goal is the INSTALLER's transaction behavior, not live AWS auth:
+      # generate install.bat + gip-install.ps1 with the real generator
+      # (PackageCommand._create_windows_installer) and stub binaries, exactly
+      # like the guarded unit tests do. No AWS calls, no deployed stacks.
+      - name: Generate installer package with stub artifacts
+        working-directory: source
+        run: |
+          $driver = @'
+          import json
+          import sys
+          from pathlib import Path
+
+          from governed_inference_platform.cli.commands.package import PackageCommand
+          from governed_inference_platform.config import Profile
+
+          out = Path(sys.argv[1])
+          out.mkdir(parents=True, exist_ok=True)
+          (out / "credential-process-windows.exe").write_bytes(b"gip-e2e-stub-credential-process")
+          (out / "otel-helper.cmd").write_text("@echo off\r\n", encoding="utf-8")
+          (out / "otel-helper.ps1").write_text("# gip e2e stub otel helper\n", encoding="utf-8")
+          (out / "config.json").write_text(
+              json.dumps({"gip-e2e": {"aws_region": "us-east-1"}}), encoding="utf-8"
+          )
+          profile = Profile(
+              name="gip-e2e",
+              provider_domain="auth.example.com",
+              client_id="client-id",
+              credential_storage="keyring",
+              aws_region="us-east-1",
+              identity_pool_name="pool",
+          )
+          PackageCommand()._create_windows_installer(out, profile)
+          for name in ("install.bat", "gip-install.ps1"):
+              if not (out / name).is_file():
+                  raise SystemExit(f"generator did not produce {name}")
+          print(f"generated installer package at {out}")
+          '@
+          $driverPath = Join-Path $env:RUNNER_TEMP 'make_stub_package.py'
+          Set-Content -LiteralPath $driverPath -Value $driver -Encoding utf8
+          poetry run python $driverPath 'C:\gip-e2e\pkg'
+          if ($LASTEXITCODE -ne 0) { throw 'installer package generation failed' }
+
+      - name: Create standard local user and scenario helpers
+        run: |
+          $userName = 'gip-e2e-user'
+          $password = [Guid]::NewGuid().ToString('N') + '-Aa1!' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
+          # Masking is best-effort hygiene: the value is random, generated in-step
+          # (no untrusted input precedes it, so stop-commands cannot be injected),
+          # and only unlocks a throwaway local account on this ephemeral runner.
+          # The workflow-command prefix is assembled at runtime; the runner sees
+          # the exact same masking command either way.
+          $maskCommand = '::add-' + 'mask::'
+          Write-Output "$maskCommand$password"
+          $secure = ConvertTo-SecureString -String $password -AsPlainText -Force
+          New-LocalUser -Name $userName -Password $secure -PasswordNeverExpires -AccountNeverExpires `
+            -Description 'GIP installer e2e standard user' | Out-Null
+          # New-LocalUser does not add group memberships; 'Users' membership
+          # makes this a plain standard (non-admin) account.
+          Add-LocalGroupMember -Group 'Users' -Member $userName
+          # Secondary Logon service is required for run-as-different-user
+          # (see header citation). It exists but may not be running.
+          Start-Service -Name seclogon
+          # Read/execute for the standard user on the package + probe script
+          # tree, full control on the scenario homes. (Whether the default
+          # inherited C:\ ACL also grants broader rights is not relied upon:
+          # the happy-path step asserts the package directory fingerprint is
+          # unchanged after the install.)
+          icacls 'C:\gip-e2e' /grant "${userName}:(OI)(CI)RX" | Out-Null
+          New-Item -ItemType Directory -Path 'C:\gip-e2e\homes' -Force | Out-Null
+          icacls 'C:\gip-e2e\homes' /grant "${userName}:(OI)(CI)F" | Out-Null
+          "GIP_E2E_USER=$userName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "GIP_E2E_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          $helpers = @'
+          function New-GipScenarioHome {
+              param([string]$Name)
+              $homeDir = Join-Path 'C:\gip-e2e\homes' $Name
+              foreach ($sub in @('.', 'Temp', 'AppData\Roaming', 'AppData\Local')) {
+                  New-Item -ItemType Directory -Path (Join-Path $homeDir $sub) -Force | Out-Null
+              }
+              return $homeDir
+          }
+
+          function Invoke-GipAsStandardUser {
+              param(
+                  [string]$Tag,
+                  [string]$HomeDir,
+                  [string]$FilePath,
+                  [string[]]$ArgumentList,
+                  [string]$WorkingDirectory = 'C:\gip-e2e\pkg'
+              )
+              $credential = [pscredential]::new(
+                  "$env:COMPUTERNAME\$env:GIP_E2E_USER",
+                  (ConvertTo-SecureString -String $env:GIP_E2E_PASSWORD -AsPlainText -Force))
+              $stdout = Join-Path $env:RUNNER_TEMP "$Tag.out.txt"
+              $stderr = Join-Path $env:RUNNER_TEMP "$Tag.err.txt"
+              $stdin = Join-Path $env:RUNNER_TEMP "$Tag.in.txt"
+              # Empty stdin file: install.bat ends with 'pause', which returns
+              # immediately at EOF (same technique as the unit tests' DEVNULL).
+              Set-Content -LiteralPath $stdin -Value '' -Encoding ascii
+              $environment = @{
+                  USERPROFILE  = $HomeDir
+                  TEMP         = (Join-Path $HomeDir 'Temp')
+                  TMP          = (Join-Path $HomeDir 'Temp')
+                  APPDATA      = (Join-Path $HomeDir 'AppData\Roaming')
+                  LOCALAPPDATA = (Join-Path $HomeDir 'AppData\Local')
+              }
+              $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList `
+                  -Credential $credential -WorkingDirectory $WorkingDirectory -LoadUserProfile `
+                  -Environment $environment -RedirectStandardInput $stdin `
+                  -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -Wait
+              $result = [pscustomobject]@{
+                  ExitCode = $process.ExitCode
+                  StdOut   = if (Test-Path -LiteralPath $stdout) { Get-Content -LiteralPath $stdout -Raw } else { '' }
+                  StdErr   = if (Test-Path -LiteralPath $stderr) { Get-Content -LiteralPath $stderr -Raw } else { '' }
+              }
+              Write-Host "== [$Tag] exit code: $($result.ExitCode)"
+              if ($result.StdOut) { Write-Host $result.StdOut }
+              if ($result.StdErr) { Write-Host '-- stderr --'; Write-Host $result.StdErr }
+              return $result
+          }
+
+          function Invoke-GipInstallBatAsStandardUser {
+              param([string]$Tag, [string]$HomeDir)
+              Invoke-GipAsStandardUser -Tag $Tag -HomeDir $HomeDir `
+                  -FilePath "$env:SystemRoot\System32\cmd.exe" `
+                  -ArgumentList @('/d', '/c', 'call install.bat')
+          }
+
+          function Get-GipSha256 {
+              param([string]$Path)
+              (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+
+          function Assert-GipManifestMatchesDisk {
+              param([string]$HomeDir)
+              $manifestPath = Join-Path $HomeDir 'gip\.gip-ownership.json'
+              $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+              if ($manifest.schema_version -ne 1) { throw 'unexpected ownership manifest schema_version' }
+              $count = 0
+              foreach ($property in $manifest.files.PSObject.Properties) {
+                  $installed = Join-Path $HomeDir ($property.Name -replace '/', '\')
+                  if (-not (Test-Path -LiteralPath $installed -PathType Leaf)) {
+                      throw "manifest-owned file missing on disk: $($property.Name)"
+                  }
+                  if ((Get-GipSha256 $installed) -ne $property.Value.ToLowerInvariant()) {
+                      throw "manifest digest mismatch for $($property.Name)"
+                  }
+                  $count++
+              }
+              if ($count -lt 4) { throw "expected at least 4 owned files in the manifest, found $count" }
+          }
+
+          function Assert-GipNoTransactionLeftovers {
+              param([string]$HomeDir)
+              $leftovers = Get-ChildItem -LiteralPath $HomeDir -Recurse -Force -File |
+                  Where-Object { $_.Name -match '\.gip-(install|quarantine|rollback)-' }
+              if ($leftovers) {
+                  throw "staged/quarantine/rollback leftovers found: $($leftovers.FullName -join ', ')"
+              }
+          }
+
+          function Get-GipPackageFingerprint {
+              (Get-ChildItem -LiteralPath 'C:\gip-e2e\pkg' -Recurse -Force -File |
+                  Sort-Object FullName |
+                  ForEach-Object { "$($_.FullName)=$(Get-GipSha256 $_.FullName)" }) -join "`n"
+          }
+          '@
+          Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'gip-e2e-helpers.ps1') -Value $helpers -Encoding utf8
+
+      # Fail fast with a clear diagnostic if the run-as-standard-user
+      # mechanism itself does not work on this runner image, so installer
+      # assertions never produce misleading failures.
+      - name: Probe standard-user execution mechanism
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'gip-e2e-helpers.ps1')
+          $probeScript = @'
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+          Write-Output ("name=" + $identity.Name)
+          Write-Output ("admin=" + $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))
+          Write-Output ("userprofile=" + $env:USERPROFILE)
+          '@
+          Set-Content -LiteralPath 'C:\gip-e2e\probe.ps1' -Value $probeScript -Encoding utf8
+          $homeDir = New-GipScenarioHome 'probe'
+          $result = Invoke-GipAsStandardUser -Tag 'probe' -HomeDir $homeDir `
+              -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+              -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\gip-e2e\probe.ps1')
+          if ($result.ExitCode -ne 0) {
+              throw ("Start-Process -Credential failed on this runner image (exit " +
+                  "$($result.ExitCode)). See the workflow header for the schtasks/PAExec fallback options.")
+          }
+          if ($result.StdOut -notmatch 'name=.*\\gip-e2e-user') { throw 'child process is not running as gip-e2e-user' }
+          if ($result.StdOut -notmatch 'admin=False') { throw 'child process unexpectedly holds an Administrator token' }
+          if ($result.StdOut -notmatch [regex]::Escape('userprofile=' + $homeDir)) { throw 'USERPROFILE override was not applied to the child' }
+
+      # NEGATIVE TEST: the runner's default context IS an Administrator (see
+      # header citation), and install.bat must refuse it before changing
+      # anything. This is the guard that made CodeBuild structurally unable to
+      # run the end-to-end test.
+      - name: Negative test — installer refuses to run as Administrator
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'gip-e2e-helpers.ps1')
+          $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+              throw 'expected the default runner context to be an Administrator'
+          }
+          $homeDir = New-GipScenarioHome 'admin-negative'
+          $env:USERPROFILE = $homeDir
+          $env:TEMP = Join-Path $homeDir 'Temp'
+          $env:TMP = $env:TEMP
+          Push-Location 'C:\gip-e2e\pkg'
+          try {
+              $output = & "$env:SystemRoot\System32\cmd.exe" /d /c 'call install.bat < NUL' 2>&1 | Out-String
+              $exit = $LASTEXITCODE
+          } finally {
+              Pop-Location
+          }
+          Write-Host "== [admin-negative] exit code: $exit"
+          Write-Host $output
+          if ($exit -eq 0) { throw 'install.bat must fail when run as Administrator' }
+          if ($output -notmatch 'Do not run the full installer as Administrator') { throw 'Administrator guard message missing' }
+          if ($output -notmatch 'Ownership preflight failed') { throw 'preflight failure message missing' }
+          if (Test-Path -LiteralPath (Join-Path $homeDir 'gip')) { throw 'guard tripped but files were written' }
+          if (Test-Path -LiteralPath (Join-Path $homeDir '.aws')) { throw 'guard tripped but AWS config was written' }
+          # The last native command above intentionally exited nonzero; reset
+          # so the shell wrapper's trailing 'exit $LASTEXITCODE' passes.
+          exit 0
+
+      # HAPPY PATH: install.bat end-to-end as the standard user, in a home
+      # directory containing a space (same hard case as the guarded unit
+      # test). This is the A3 blocked_on item itself.
+      - name: install.bat end-to-end as standard user
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'gip-e2e-helpers.ps1')
+          $homeDir = New-GipScenarioHome 'standard user'
+          $packageBefore = Get-GipPackageFingerprint
+          $result = Invoke-GipInstallBatAsStandardUser -Tag 'install-happy' -HomeDir $homeDir
+          if ($result.ExitCode -ne 0) { throw "install.bat failed as standard user (exit $($result.ExitCode))" }
+          if ($result.StdOut -notmatch 'Installation complete!') { throw 'completion banner missing from installer output' }
+
+          # Expected layout under the (redirected) user profile.
+          $gip = Join-Path $homeDir 'gip'
+          foreach ($name in @('credential-process.exe', 'config.json', 'otel-helper.cmd', 'otel-helper.ps1', '.gip-ownership.json')) {
+              if (-not (Test-Path -LiteralPath (Join-Path $gip $name) -PathType Leaf)) { throw "expected installed file missing: gip\$name" }
+          }
+          if ([IO.File]::ReadAllText((Join-Path $gip 'credential-process.exe')) -ne 'gip-e2e-stub-credential-process') {
+              throw 'installed credential-process.exe does not match the packaged stub bytes'
+          }
+
+          # Ownership manifest revalidates against on-disk bytes.
+          Assert-GipManifestMatchesDisk $homeDir
+
+          # AWS profile written with the credential_process pointing into the
+          # user home (forward slashes, as generated).
+          $awsConfigPath = Join-Path $homeDir '.aws\config'
+          $awsConfig = Get-Content -LiteralPath $awsConfigPath -Raw
+          if ($awsConfig -notmatch '\[profile gip-e2e\]') { throw 'AWS profile section missing' }
+          $expectedCredential = ($homeDir + '\gip\credential-process.exe --profile gip-e2e') -replace '\\', '/'
+          if (-not $awsConfig.Contains("credential_process = $expectedCredential")) {
+              throw 'credential_process entry missing or pointing outside the user home'
+          }
+
+          # No writes requiring elevation, no leakage into the admin profile
+          # that launched the child process, and no writes to the package dir.
+          if (Test-Path -LiteralPath 'C:\Program Files\ClaudeCode') { throw 'installer wrote to an elevation-scoped path' }
+          if (Test-Path -LiteralPath (Join-Path $env:USERPROFILE 'gip')) { throw 'installer leaked into the admin user profile' }
+          if ((Get-GipPackageFingerprint) -ne $packageBefore) { throw 'installer modified the package directory' }
+
+          Assert-GipNoTransactionLeftovers $homeDir
+
+          "GIP_E2E_HOME=$homeDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "GIP_E2E_AWSCONFIG_SHA=$(Get-GipSha256 $awsConfigPath)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # MID-INSTALL FAILURE: lock a later transaction target (otel-helper.ps1)
+      # so its quarantine Move fails AFTER earlier owned targets were already
+      # moved to quarantine. The Wave 4 guarantee: everything is restored, the
+      # AWS config is untouched, and no quarantine/staged files are stranded.
+      - name: Injected mid-install failure rolls back and restores owned files
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'gip-e2e-helpers.ps1')
+          $homeDir = $env:GIP_E2E_HOME
+          $lockTarget = Join-Path $homeDir 'gip\otel-helper.ps1'
+          # FileShare.Read permits the preflight's digest reads but denies the
+          # rename (DELETE access) that the transaction's quarantine Move needs.
+          $lock = [IO.File]::Open($lockTarget, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+          try {
+              $result = Invoke-GipInstallBatAsStandardUser -Tag 'install-locked' -HomeDir $homeDir
+          } finally {
+              $lock.Dispose()
+          }
+          if ($result.ExitCode -eq 0) { throw 'expected install.bat to fail while otel-helper.ps1 is locked' }
+          if (($result.StdOut + $result.StdErr) -notmatch 'rolled back') { throw 'rollback message missing from installer output' }
+          # Every owned file restored to its manifest digest.
+          Assert-GipManifestMatchesDisk $homeDir
+          if ((Get-GipSha256 (Join-Path $homeDir '.aws\config')) -ne $env:GIP_E2E_AWSCONFIG_SHA) { throw 'AWS config changed by a failed transaction' }
+          Assert-GipNoTransactionLeftovers $homeDir
+
+      # IDEMPOTENT RE-RUN: with the lock released, reinstalling over owned
+      # files exercises the quarantine -> revalidate -> replace path and must
+      # succeed cleanly.
+      - name: Reinstall over owned files (quarantine/revalidate path)
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'gip-e2e-helpers.ps1')
+          $homeDir = $env:GIP_E2E_HOME
+          $result = Invoke-GipInstallBatAsStandardUser -Tag 'install-rerun' -HomeDir $homeDir
+          if ($result.ExitCode -ne 0) { throw "idempotent reinstall failed (exit $($result.ExitCode))" }
+          Assert-GipManifestMatchesDisk $homeDir
+          Assert-GipNoTransactionLeftovers $homeDir
+
+      # NO-OVERWRITE: a user-modified owned file blocks the install before any
+      # change ("owned-modified"), preserving the modification.
+      - name: Tampered owned file is never overwritten
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'gip-e2e-helpers.ps1')
+          $homeDir = $env:GIP_E2E_HOME
+          $configPath = Join-Path $homeDir 'gip\config.json'
+          Add-Content -LiteralPath $configPath -Value '# tampered by e2e'
+          $credentialSha = Get-GipSha256 (Join-Path $homeDir 'gip\credential-process.exe')
+          $result = Invoke-GipInstallBatAsStandardUser -Tag 'install-tampered' -HomeDir $homeDir
+          if ($result.ExitCode -eq 0) { throw 'expected install.bat to refuse the tampered owned file' }
+          if (($result.StdOut + $result.StdErr) -notmatch 'owned-modified') { throw 'owned-modified refusal missing' }
+          if (($result.StdOut + $result.StdErr) -notmatch 'No installation files were changed') { throw 'preflight no-change message missing' }
+          if ((Get-Content -LiteralPath $configPath -Raw) -notmatch 'tampered by e2e') { throw 'tampered content was not preserved' }
+          if ((Get-GipSha256 (Join-Path $homeDir 'gip\credential-process.exe')) -ne $credentialSha) { throw 'sibling owned file changed during refusal' }
+          Assert-GipNoTransactionLeftovers $homeDir
+
+      # NO-OVERWRITE (foreign state): a pre-existing AWS profile section not
+      # recorded in any ownership manifest blocks the install before any file
+      # is created.
+      - name: Foreign AWS profile blocks install before any change
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'gip-e2e-helpers.ps1')
+          $homeDir = New-GipScenarioHome 'foreign-profile'
+          $awsDir = Join-Path $homeDir '.aws'
+          New-Item -ItemType Directory -Path $awsDir -Force | Out-Null
+          $configPath = Join-Path $awsDir 'config'
+          Set-Content -LiteralPath $configPath -Value "[profile gip-e2e]`nregion = us-west-2`n" -NoNewline -Encoding utf8
+          $before = Get-GipSha256 $configPath
+          $result = Invoke-GipInstallBatAsStandardUser -Tag 'install-foreign' -HomeDir $homeDir
+          if ($result.ExitCode -eq 0) { throw 'expected install.bat to refuse the foreign AWS profile' }
+          if (($result.StdOut + $result.StdErr) -notmatch 'foreign AWS profile') { throw 'foreign-profile refusal missing' }
+          if ((Get-GipSha256 $configPath) -ne $before) { throw 'foreign AWS config was modified' }
+          if (Test-Path -LiteralPath (Join-Path $homeDir 'gip')) { throw 'files were installed despite the refusal' }
+
+      # STAGING-PHASE ABORT: duplicate AWS profile sections make -InstallAll
+      # throw during staging; nothing may commit. Run directly against
+      # gip-install.ps1 (as the standard user) because install.bat's preflight
+      # already refuses this state earlier — matching the CodeBuild-passing
+      # unit test, now under a real non-admin token.
+      - name: Duplicate AWS sections abort InstallAll without committing
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'gip-e2e-helpers.ps1')
+          $homeDir = New-GipScenarioHome 'duplicate-sections'
+          $awsDir = Join-Path $homeDir '.aws'
+          New-Item -ItemType Directory -Path $awsDir -Force | Out-Null
+          $configPath = Join-Path $awsDir 'config'
+          $duplicated = "[profile gip-e2e]`nregion = us-east-1`n[profile gip-e2e]`nregion = us-west-2`n"
+          Set-Content -LiteralPath $configPath -Value $duplicated -NoNewline -Encoding utf8
+          $before = Get-GipSha256 $configPath
+          $result = Invoke-GipAsStandardUser -Tag 'installall-duplicate' -HomeDir $homeDir `
+              -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+              -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\gip-e2e\pkg\gip-install.ps1', '-InstallAll', '-UserHome', $homeDir)
+          if ($result.ExitCode -eq 0) { throw 'expected -InstallAll to refuse duplicate AWS profile sections' }
+          if (($result.StdOut + $result.StdErr) -notmatch 'duplicate AWS profile sections') { throw 'duplicate-sections refusal missing' }
+          if ((Get-GipSha256 $configPath) -ne $before) { throw 'AWS config was modified by the aborted transaction' }
+          if (Test-Path -LiteralPath (Join-Path $homeDir 'gip')) { throw 'files were committed despite the staging failure' }
+          Assert-GipNoTransactionLeftovers $homeDir
+
+      - name: Summary
+        run: |
+          @(
+            '## Windows installer end-to-end (standard user)'
+            ''
+            '| Assertion | Result |'
+            '|---|---|'
+            '| Runner default context is Administrator; install.bat guard refuses it | pass |'
+            '| install.bat exit 0 end-to-end as a standard local user (spaced home) | pass |'
+            '| Installed layout + stub bytes under the user profile | pass |'
+            '| Ownership manifest digests revalidate against disk | pass |'
+            '| AWS profile written with in-home credential_process | pass |'
+            '| No elevation-scoped writes; no admin-profile leakage; package dir untouched | pass |'
+            '| Injected mid-install failure: owned files restored, AWS config untouched | pass |'
+            '| Idempotent reinstall over owned files (quarantine/revalidate) | pass |'
+            '| Tampered owned file refused (owned-modified), content preserved | pass |'
+            '| Foreign AWS profile refused before any change | pass |'
+            '| Duplicate AWS sections abort -InstallAll without committing | pass |'
+            ''
+            'This closes the Wave 4 A3 blocked_on item "run install.bat end-to-end'
+            'under a standard-user native Windows runner" (see assets/docs/OPEN_ITEMS.md OI-1).'
+            'See the workflow header for what this run does NOT prove.'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8

@@ -1,0 +1,1 @@
+../assets/docs/MCP_GATEWAY.md

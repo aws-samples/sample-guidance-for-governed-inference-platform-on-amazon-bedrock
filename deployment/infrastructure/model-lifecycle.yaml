@@ -1,0 +1,468 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Claude Code model lifecycle alerts — daily Bedrock modelLifecycle poll for the
+  models this deployment references, SNS alert ladder (legacy / provider-set
+  premium pricing / end-of-life countdown), and an AWS Health passthrough rule.
+  Optional standalone stack (~$0/month); see ADR-0018.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Deployment profile"
+        Parameters:
+          - ProfileName
+          - CheckRegions
+      - Label:
+          default: "Alerting"
+        Parameters:
+          - AlertTopicArn
+          - AlertTopicKmsKeyArn
+          - LegacyPremiumWarningDays
+          - EolWarningDays
+      - Label:
+          default: "Schedule"
+        Parameters:
+          - ScheduleExpression
+    ParameterLabels:
+      ProfileName:
+        default: "Deployment profile name"
+      CheckRegions:
+        default: "Regions to poll for model lifecycle"
+      AlertTopicArn:
+        default: "Existing SNS topic ARN (empty = create one)"
+      AlertTopicKmsKeyArn:
+        default: "KMS key ARN of the existing topic (empty = not encrypted)"
+      LegacyPremiumWarningDays:
+        default: "Premium-pricing warning lead time (days)"
+      EolWarningDays:
+        default: "End-of-life countdown thresholds (days)"
+      ScheduleExpression:
+        default: "Check schedule"
+
+Parameters:
+  ProfileName:
+    Type: String
+    Description: gip profile name — SSM parameter path segment (/gip/<profile>/...)
+    AllowedPattern: '[a-zA-Z0-9\-]+'
+    MaxLength: 64
+
+  AlertTopicArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Existing SNS topic ARN to reuse (e.g. the quota stack's
+      gip-quota-alerts). Leave empty to create a dedicated topic encrypted
+      with a stack-owned KMS key.
+      NOTE: when reusing an external topic, its access policy must allow
+      events.amazonaws.com to Publish or the AWS Health rule cannot deliver
+      (the daily poll Lambda is unaffected and remains authoritative). If the
+      external topic is encrypted, its KMS key policy must additionally allow
+      events.amazonaws.com and cloudwatch.amazonaws.com to use the key, and
+      AlertTopicKmsKeyArn must name that key so the poll Lambda can publish.
+
+  AlertTopicKmsKeyArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[a-z\-]+:kms:[a-z0-9\-]+:[0-9]{12}:key/[a-zA-Z0-9\-]+$'
+    Description: >-
+      KMS key ARN that encrypts the AlertTopicArn topic (empty = the external
+      topic is not encrypted). Grants the check Lambda role kms:GenerateDataKey
+      and kms:Decrypt on that key, which SNS requires from publishers to an
+      encrypted topic. Ignored when AlertTopicArn is empty (the created topic
+      uses the stack-owned key).
+
+  ScheduleExpression:
+    Type: String
+    Default: 'rate(1 day)'
+    Description: How often the lifecycle check runs (daily is sufficient — dates move monthly)
+
+  LegacyPremiumWarningDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 180
+    Description: Warn this many days before publicExtendedAccessTime (provider-set premium pricing)
+
+  EolWarningDays:
+    Type: String
+    Default: '60,30,7'
+    AllowedPattern: '[0-9]+(,[0-9]+)*'
+    Description: Escalating CRITICAL countdown thresholds (days before endOfLifeTime)
+
+  CheckRegions:
+    Type: CommaDelimitedList
+    Default: 'us-east-1'
+    Description: >-
+      Regions to poll ListFoundationModels in (the profile's allowed Bedrock
+      regions). GovCloud lifecycle is only visible from a GovCloud region, so
+      it is covered only when this stack runs there.
+
+Conditions:
+  CreateTopic: !Equals [!Ref AlertTopicArn, '']
+  HasAlertTopicKmsKey: !Not [!Equals [!Ref AlertTopicKmsKeyArn, '']]
+  # External (AlertTopicArn) topic that is encrypted: grant the check Lambda on
+  # the supplied key. AlertTopicKmsKeyArn is ignored when the topic is created
+  # here (the stack-owned key is used).
+  UsesExternalTopicKey: !And [!Not [!Condition CreateTopic], !Condition HasAlertTopicKmsKey]
+
+Resources:
+  # Customer-managed key for the dedicated alert topic. The AWS-managed
+  # aws/sns key cannot be used here: its key policy is fixed and does not
+  # grant events.amazonaws.com / cloudwatch.amazonaws.com, so the AWS Health
+  # rule and the error alarm below could not publish (SNS Developer Guide,
+  # "Enable compatibility between event sources from AWS services and
+  # encrypted topics": https://docs.aws.amazon.com/sns/latest/dg/sns-key-management.html).
+  # One statement per AWS-service publisher of LifecycleAlertTopic; the Lambda
+  # publisher is granted through LifecycleCheckKmsPolicy on its execution role
+  # instead (the account-root statement delegates that to IAM).
+  LifecycleAlertTopicKey:
+    Type: AWS::KMS::Key
+    Condition: CreateTopic
+    Properties:
+      Description: CMK for the gip-model-lifecycle-alerts SNS topic (model lifecycle alerts)
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          # SNS itself, bound to this topic via the encryption context
+          # (sns-enable-encryption-for-topic, "Permissions for custom KMS keys").
+          - Sid: SnsServiceUse
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:EncryptionContext:aws:sns:topicArn': !Sub 'arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:gip-model-lifecycle-alerts'
+          # HealthEventsRule (EventBridge). Deliberately no aws:Source*
+          # condition: the SNS Developer Guide states aws:SourceAccount /
+          # aws:SourceArn / aws:SourceOrgID are not supported for
+          # EventBridge-to-encrypted-topic delivery. The confused-deputy
+          # control is LifecycleAlertTopicPolicy (aws:SourceAccount on
+          # sns:Publish).
+          - Sid: EventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: '*'
+          # LifecycleCheckErrorAlarm (CloudWatch alarm actions).
+          - Sid: CloudWatchAlarmsPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  LifecycleAlertTopicKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: CreateTopic
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-lifecycle-alerts'
+      TargetKeyId: !Ref LifecycleAlertTopicKey
+
+  # Dedicated alert topic (only when no existing topic ARN is supplied —
+  # mirrors quota-monitoring's gip-quota-alerts pattern). TopicName is
+  # unchanged from the unencrypted version so existing subscriptions survive
+  # the update (KmsMasterKeyId updates without interruption).
+  LifecycleAlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateTopic
+    Properties:
+      TopicName: gip-model-lifecycle-alerts
+      DisplayName: Claude Code Model Lifecycle Alerts
+      KmsMasterKeyId: !Ref LifecycleAlertTopicKey
+      Tags:
+        - Key: Name
+          Value: GIPModelLifecycleAlerts
+        # F-005: Keep tag values within the shared service tag character set.
+        - Key: Purpose
+          Value: Model lifecycle legacy/premium/EOL notifications
+
+  # Allow EventBridge (the AWS Health rule below) and CloudWatch (the error
+  # alarm) to publish to the created topic.
+  LifecycleAlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: CreateTopic
+    Properties:
+      Topics:
+        - !Ref LifecycleAlertTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref LifecycleAlertTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+          - Sid: AllowCloudWatchAlarmsPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref LifecycleAlertTopic
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  # Models this deployment references — seeded by `gip deploy model-lifecycle`
+  # from the profile (selected model + resolved tier defaults + extra_models
+  # overlay). SSM rather than a CFN parameter so a model rotation only needs a
+  # put-parameter, not a stack update (R14 §2.3).
+  TrackedModelsParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/gip/${ProfileName}/tracked-models'
+      Type: String
+      Value: '[]'
+      Description: JSON list of model IDs the deployment references (seeded at deploy time)
+
+  # Last-alerted state so the daily schedule does not re-send the same alert
+  # every day (transition + weekly reminder semantics live in the Lambda).
+  AlertStateParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/gip/${ProfileName}/lifecycle-alert-state'
+      Type: String
+      Value: '{}'
+      Description: JSON map of already-sent lifecycle alert keys per tracked model
+
+  LifecycleCheckRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "bedrock:ListFoundationModels/GetFoundationModel are non-resource-specific by API design (same suppression as existing templates)"
+      guard:
+        SuppressedRules:
+          # Single-purpose policy scoped to this role only - converting to a
+          # managed policy adds no security.
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: ModelLifecycleCheckPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TrackedModelsParam}'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AlertStateParam}'
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AlertStateParam}'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If [CreateTopic, !Ref LifecycleAlertTopic, !Ref AlertTopicArn]
+              # The KMS grant for publishing to an encrypted topic lives in
+              # LifecycleCheckKmsPolicy / LifecycleCheckExternalKmsPolicy
+              # (conditional resources).
+              # Failed async (EventBridge) invocations land in the DLQ
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt LifecycleCheckDLQ.Arn
+
+  # Publishing to an encrypted topic needs kms:GenerateDataKey + kms:Decrypt
+  # on the topic's key (SNS Developer Guide, "Allow a user to send messages to
+  # a topic with SSE"). Separate conditional policies (not !If statements
+  # inside the role) so the grant is absent for an unencrypted external topic
+  # and the role's inline policy stays a plain statement list for policy
+  # scanners. Created topic: the stack-owned key.
+  LifecycleCheckKmsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: CreateTopic
+    Properties:
+      Description: Lets the model lifecycle check Lambda publish to the KMS-encrypted alert topic
+      Roles:
+        - !Ref LifecycleCheckRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublishToEncryptedAlertTopic
+            Effect: Allow
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: !GetAtt LifecycleAlertTopicKey.Arn
+
+  # External encrypted topic: the key named by AlertTopicKmsKeyArn (e.g. the
+  # quota stack's QuotaAlertTopicKmsKeyArn output when reusing its topic).
+  LifecycleCheckExternalKmsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: UsesExternalTopicKey
+    Properties:
+      Description: Lets the model lifecycle check Lambda publish to the external KMS-encrypted alert topic
+      Roles:
+        - !Ref LifecycleCheckRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublishToEncryptedAlertTopic
+            Effect: Allow
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: !Ref AlertTopicKmsKeyArn
+
+  # DLQ for failed async (EventBridge-scheduled) lifecycle check invocations
+  LifecycleCheckDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: gip-model-lifecycle-dlq
+      # AWS-managed SQS key: the Lambda service writes with the execution
+      # role, which the aws/sqs key policy already covers for this account.
+      KmsMasterKeyId: alias/aws/sqs
+      MessageRetentionPeriod: 1209600
+
+  LifecycleCheckFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Invoked by EventBridge schedule; needs internet access for Bedrock/SSM/SNS — VPC adds complexity without security benefit"
+          - id: W92
+            reason: "One invocation per day — reserved concurrency unnecessary"
+    Properties:
+      Description: Daily Bedrock model lifecycle check for tracked models (legacy/premium/EOL alert ladder)
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LifecycleCheckRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      DeadLetterConfig:
+        TargetArn: !GetAtt LifecycleCheckDLQ.Arn
+      Environment:
+        Variables:
+          TRACKED_MODELS_PARAM: !Ref TrackedModelsParam
+          ALERT_STATE_PARAM: !Ref AlertStateParam
+          SNS_TOPIC_ARN: !If [CreateTopic, !Ref LifecycleAlertTopic, !Ref AlertTopicArn]
+          LEGACY_PREMIUM_WARNING_DAYS: !Ref LegacyPremiumWarningDays
+          EOL_WARNING_DAYS: !Ref EolWarningDays
+          CHECK_REGIONS: !Join [',', !Ref CheckRegions]
+      Code: ./lambda-functions/model_lifecycle/
+
+  DailyScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Trigger the model lifecycle check (daily poll is authoritative — works on any support tier)
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LifecycleCheckFunction.Arn
+          Id: ModelLifecycleCheckTarget
+
+  DailySchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LifecycleCheckFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyScheduleRule.Arn
+
+  # AWS Health passthrough: Bedrock planned-lifecycle notices (model deprecation)
+  # arrive as aws.health scheduledChange events. Free push-based complement to
+  # the daily poll — delivery does not require a Business/Enterprise support
+  # plan (only the Health *API* does). R14 §7: the exact eventTypeCode strings
+  # for Bedrock lifecycle events are unverified, so this filter is deliberately
+  # permissive (service + category only) and degrades safely — worst case is an
+  # extra Bedrock health notification on the topic, never a missed alert
+  # (the daily poll remains authoritative).
+  HealthEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Forward AWS Health Bedrock scheduled-change events (model deprecation notices) to the alert topic
+      EventPattern:
+        source:
+          - aws.health
+        detail:
+          service:
+            - BEDROCK
+          eventTypeCategory:
+            - scheduledChange
+      State: ENABLED
+      Targets:
+        - Arn: !If [CreateTopic, !Ref LifecycleAlertTopic, !Ref AlertTopicArn]
+          Id: ModelLifecycleHealthTarget
+
+  # A5 fail-visible: the lifecycle check must never fail silently — a broken
+  # poller is indistinguishable from "no lifecycle news" without this alarm.
+  LifecycleCheckErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Model lifecycle check Lambda is failing — lifecycle alerts are NOT being evaluated
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LifecycleCheckFunction
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If [CreateTopic, !Ref LifecycleAlertTopic, !Ref AlertTopicArn]
+
+Outputs:
+  LifecycleAlertTopicArn:
+    Description: SNS topic receiving model lifecycle alerts (created or reused)
+    Value: !If [CreateTopic, !Ref LifecycleAlertTopic, !Ref AlertTopicArn]
+    Export:
+      Name: !Sub '${AWS::StackName}-LifecycleAlertTopicArn'
+
+  LifecycleCheckFunctionArn:
+    Description: ARN of the model lifecycle check Lambda function
+    Value: !GetAtt LifecycleCheckFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LifecycleCheckFunctionArn'
+
+  TrackedModelsParameterName:
+    Description: SSM parameter listing the tracked model IDs (seeded/updated by gip deploy model-lifecycle)
+    Value: !Ref TrackedModelsParam
+    Export:
+      Name: !Sub '${AWS::StackName}-TrackedModelsParameterName'

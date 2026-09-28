@@ -1,0 +1,2725 @@
+#!/usr/bin/env python3
+# ABOUTME: AWS Credential Provider for OIDC authentication and Cognito Identity Pool federation
+# ABOUTME: Supports multiple OIDC providers including Okta and Azure AD for Bedrock access
+"""
+AWS Credential Provider for OIDC + Cognito Identity Pool
+Supports multiple OIDC providers for Bedrock access
+
+DEPRECATED: The Go credential-process (source/go/cmd/credential-process/) is the
+default build since June 2026. This Python implementation is retained as the
+`gip package --legacy` build source, the automatic fallback when Go >= 1.24 is
+unavailable, and the reference for Go/Python parity tests. Do not add new
+features here without a matching Go implementation. See
+assets/docs/adr/0013-legacy-python-credential-provider.md for the deprecation
+plan and removal conditions.
+"""
+
+import base64
+import errno
+import hashlib
+import html as html_module
+import json
+import os
+import platform
+import re
+import secrets
+import socket
+import sys
+import threading
+import time
+import webbrowser
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlparse
+
+import boto3
+import jwt
+import keyring
+import requests
+from botocore import UNSIGNED
+from botocore.config import Config
+
+# Decode kwargs for extracting claims from tokens whose signatures are
+# verified elsewhere. Local decodes are claims extraction only (nonce check,
+# session naming, expiry display): authorization always happens at STS
+# AssumeRoleWithWebIdentity, which verifies the token signature against the
+# issuer's JWKS server-side before any credentials are minted — a tampered
+# token cannot mint credentials.
+_CLAIMS_ONLY_DECODE_KWARGS = {"options": {"verify_signature": False}}
+
+
+# F-010: Packaged configs use a nested profiles object; retain flat-config support.
+def _profile_mapping(file_config: dict) -> dict[str, dict]:
+    """Return nested profiles while accepting pre-2.5 flat package configs."""
+    profiles = file_config.get("profiles", file_config)
+    if not isinstance(profiles, dict):
+        raise ValueError('invalid config.json: "profiles" must be an object')
+    return {name: value for name, value in profiles.items() if isinstance(value, dict)}
+
+
+# Uses port-based locking: if the OAuth callback port is occupied by another
+# credential-process, wait for it to complete and read credentials from cache.
+
+__version__ = "1.0.0"
+
+# OIDC Provider Configurations
+PROVIDER_CONFIGS = {
+    "okta": {
+        "name": "Okta",
+        "authorize_endpoint": "/oauth2/{auth_server}/v1/authorize",
+        "token_endpoint": "/oauth2/{auth_server}/v1/token",  # nosec B105
+        "scopes": "openid profile email",
+        "response_type": "code",
+        "response_mode": "query",
+    },
+    "auth0": {
+        "name": "Auth0",
+        "authorize_endpoint": "/authorize",
+        "token_endpoint": "/oauth/token",
+        "scopes": "openid profile email",
+        "response_type": "code",
+        "response_mode": "query",
+    },
+    "azure": {
+        "name": "Azure AD",
+        "authorize_endpoint": "/oauth2/v2.0/authorize",
+        "token_endpoint": "/oauth2/v2.0/token",
+        "scopes": "openid profile email",
+        "response_type": "code",
+        "response_mode": "query",
+    },
+    "cognito": {
+        "name": "AWS Cognito User Pool",
+        "authorize_endpoint": "/oauth2/authorize",
+        "token_endpoint": "/oauth2/token",
+        "scopes": "openid email",
+        "response_type": "code",
+        "response_mode": "query",
+    },
+    "google": {
+        "name": "Google",
+        "authorize_endpoint": "/o/oauth2/v2/auth",
+        "token_endpoint": "https://oauth2.googleapis.com/token",  # nosec B105
+        "scopes": "openid profile email",
+        "response_type": "code",
+        "response_mode": "query",
+    },
+    # Generic OIDC: paths come from the profile (oidc_authorization_endpoint /
+    # oidc_token_endpoint), so we leave these as empty placeholders.
+    "generic": {
+        "name": "Generic OIDC",
+        "authorize_endpoint": "",
+        "token_endpoint": "",
+        "scopes": "openid profile email",
+        "response_type": "code",
+        "response_mode": "query",
+    },
+}
+
+
+class MultiProviderAuth:
+    def __init__(self, profile=None):
+        # Debug mode - set before loading config since _load_config may use _debug_print
+        self.debug = os.getenv("COGNITO_AUTH_DEBUG", "").lower() in ("1", "true", "yes")
+
+        # Load configuration from environment or config file
+        # Auto-detect profile from config.json if not specified
+        self.profile = profile or self._auto_detect_profile() or "gip"
+
+        self.config = self._load_config()
+
+        # SSO-disabled profiles use the ambient credential chain (e.g. AWS Identity Center).
+        # Skip all OIDC/Cognito setup — nothing below is needed.
+        self.sso_enabled = self.config.get("sso_enabled", True)
+        if not self.sso_enabled:
+            return
+
+        # Determine provider type from domain
+        self.provider_type = self._determine_provider_type()
+
+        # Fail clearly if provider type is unknown
+        if self.provider_type not in PROVIDER_CONFIGS:
+            raise ValueError(
+                f"Unknown provider type '{self.provider_type}'. Valid providers: {', '.join(PROVIDER_CONFIGS.keys())}"
+            )
+        self.provider_config = dict(PROVIDER_CONFIGS[self.provider_type])
+
+        # For Okta, resolve the authorization server in endpoint paths.
+        # "default" = Okta custom auth server (free/developer plans).
+        # Empty string with trailing slash removed = Org auth server (paid plans).
+        if self.provider_type == "okta":
+            auth_server = self.config.get("okta_auth_server", "")
+            if auth_server:
+                self.provider_config["authorize_endpoint"] = self.provider_config["authorize_endpoint"].format(
+                    auth_server=auth_server
+                )
+                self.provider_config["token_endpoint"] = self.provider_config["token_endpoint"].format(
+                    auth_server=auth_server
+                )
+            else:
+                # Org auth server (paid plans) — no auth server ID in path
+                self.provider_config["authorize_endpoint"] = "/oauth2/v1/authorize"
+                self.provider_config["token_endpoint"] = "/oauth2/v1/token"  # nosec B105
+
+        # OAuth callback port — also used for inter-process locking.
+        # Precedence: REDIRECT_PORT env var > config.json redirect_port > default 8400
+        env_port = os.getenv("REDIRECT_PORT")
+        config_port = self.config.get("redirect_port")
+        self.redirect_port = int(env_port) if env_port else int(config_port) if config_port else 8400
+        self.redirect_uri = f"http://localhost:{self.redirect_port}/callback"
+
+        # Initialize credential storage
+        self._init_credential_storage()
+
+    def _debug_print(self, message):
+        """Print debug message only if debug mode is enabled"""
+        if self.debug:
+            print(f"Debug: {message}", file=sys.stderr)
+
+    def _wait_for_auth_completion(self, timeout=60):
+        """Wait for another process to complete authentication using port-based detection"""
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                test_socket.bind(("127.0.0.1", self.redirect_port))
+                test_socket.close()
+                cached = self.get_cached_credentials()
+                if cached:
+                    return cached
+                else:
+                    return None
+            except OSError as e:
+                if e.errno == errno.EADDRINUSE:
+                    time.sleep(0.5)
+                else:
+                    raise
+            finally:
+                try:
+                    test_socket.close()
+                except Exception:
+                    pass  # nosec B110
+
+        return None
+
+    def _auto_detect_profile(self):
+        """Auto-detect profile name from config.json when only one profile exists."""
+        try:
+            # Try same directory as binary first (for testing)
+            binary_dir = Path(__file__).parent if not getattr(sys, "frozen", False) else Path(sys.executable).parent
+            config_path = binary_dir / "config.json"
+
+            # Fall back to installed location
+            if not config_path.exists():
+                config_path = Path.home() / "governed-inference-platform" / "config.json"
+
+            if not config_path.exists():
+                return None
+
+            with open(config_path, encoding="utf-8") as f:
+                file_config = json.load(f)
+
+            profiles = list(_profile_mapping(file_config))
+
+            if len(profiles) == 1:
+                self._debug_print(f"Auto-detected profile: {profiles[0]}")
+                return profiles[0]
+            elif len(profiles) > 1:
+                self._debug_print(f"Multiple profiles found: {profiles}. Use --profile to specify.")
+                return None
+            return None
+        except Exception as e:
+            self._debug_print(f"Could not auto-detect profile: {e}")
+            return None
+
+    def _load_config(self):
+        """Load configuration from config.json.
+
+        Priority:
+        1. Same directory as the binary (for testing dist/ packages)
+        2. ~/gip/config.json (for installed packages)
+        """
+        # Try same directory as binary first (for testing)
+        binary_dir = Path(__file__).parent if not getattr(sys, "frozen", False) else Path(sys.executable).parent
+        config_path = binary_dir / "config.json"
+
+        # Fall back to installed location
+        if not config_path.exists():
+            config_path = Path.home() / "governed-inference-platform" / "config.json"
+
+        if not config_path.exists():
+            raise ValueError(f"Configuration file not found in {binary_dir} or {Path.home() / 'gip'}")
+
+        with open(config_path, encoding="utf-8") as f:
+            file_config = json.load(f)
+
+        profiles = _profile_mapping(file_config)
+        if self.profile not in profiles:
+            raise ValueError(f"Profile '{self.profile}' not found in configuration")
+        profile_config = profiles[self.profile]
+
+        profile_config["provider_domain"] = profile_config.get("provider_domain", profile_config.get("okta_domain"))
+        profile_config["client_id"] = profile_config.get("client_id", profile_config.get("okta_client_id"))
+
+        if "identity_pool_name" in profile_config and "federated_role_arn" not in profile_config:
+            profile_config["identity_pool_id"] = profile_config["identity_pool_name"]
+
+        profile_config["credential_storage"] = profile_config.get("credential_storage", "session")
+
+        # SSO-disabled profiles skip OIDC validation entirely — credentials come
+        # from the ambient chain (AWS Identity Center, instance profile, env vars).
+        if not profile_config.get("sso_enabled", True):
+            return profile_config
+
+        # Auto-detect federation type based on configuration
+        self._detect_federation_type(profile_config)
+
+        # Validate required configuration based on federation type
+        if profile_config.get("federation_type") == "direct":
+            required = ["provider_domain", "client_id", "federated_role_arn"]
+        else:
+            required = ["provider_domain", "client_id", "identity_pool_id"]
+
+        missing = [k for k in required if not profile_config.get(k)]
+        if missing:
+            raise ValueError(f"Missing required configuration: {', '.join(missing)}")
+
+        # Set defaults
+        profile_config.setdefault("aws_region", "us-east-1")
+        profile_config.setdefault("provider_type", "auto")
+        profile_config.setdefault("credential_storage", "session")
+        profile_config.setdefault(
+            "max_session_duration", 43200 if profile_config.get("federation_type") == "direct" else 28800
+        )
+
+        # Load client secret from OS keyring if configured for secret-based confidential client.
+        # The secret is never written to config.json; it lives only in the keyring.
+        if profile_config.get("azure_auth_mode") == "secret":
+            try:
+                secret = keyring.get_password("governed-inference-platform", f"{self.profile}-client-secret")
+                if secret:
+                    profile_config["client_secret"] = secret
+            except Exception as e:
+                self._debug_print(f"Warning: could not read client secret from keyring: {e}")
+
+        return profile_config
+
+    def _detect_federation_type(self, config):
+        """Auto-detect whether to use Cognito Identity Pool or direct STS federation"""
+        # Explicit federation type takes precedence
+        if "federation_type" in config:
+            return
+
+        # Auto-detect based on available configuration
+        if "federated_role_arn" in config:
+            config["federation_type"] = "direct"
+            self._debug_print("Detected Direct STS federation mode (federated_role_arn found)")
+        elif "identity_pool_id" in config or "identity_pool_name" in config:
+            config["federation_type"] = "cognito"
+            self._debug_print("Detected Cognito Identity Pool federation mode")
+        else:
+            # Default to cognito for backward compatibility
+            config["federation_type"] = "cognito"
+            self._debug_print("Defaulting to Cognito Identity Pool federation mode")
+
+    def _determine_provider_type(self):
+        """Determine provider type from domain"""
+        domain = self.config["provider_domain"].lower()
+
+        # If provider_type is explicitly set and is a known provider, use it
+        provider_type = self.config.get("provider_type", "auto")
+        if provider_type in PROVIDER_CONFIGS:
+            return provider_type
+
+        # Secure provider detection using proper URL parsing
+        if not domain:
+            # Fail with clear error for unknown providers
+            raise ValueError(
+                "Unable to auto-detect provider type for empty domain. "
+                "Known providers: Okta, Auth0, Microsoft/Azure, AWS Cognito User Pool. "
+                "Please check your provider domain configuration."
+            )
+
+        # Handle both full URLs and domain-only inputs
+        url_to_parse = domain if domain.startswith(("http://", "https://")) else f"https://{domain}"
+
+        try:
+            parsed = urlparse(url_to_parse)
+            hostname = parsed.hostname
+
+            if not hostname:
+                # Fail with clear error for unknown providers
+                raise ValueError(
+                    f"Unable to auto-detect provider type for domain '{domain}'. "
+                    f"Known providers: Okta, Auth0, Microsoft/Azure, AWS Cognito User Pool. "
+                    f"Please check your provider domain configuration."
+                )
+
+            hostname_lower = hostname.lower()
+
+            # Check for exact domain match or subdomain match
+            # Using endswith with leading dot prevents bypass attacks
+            okta_domains = (".okta.com", ".oktapreview.com", ".okta-emea.com")
+            if hostname_lower.endswith(okta_domains) or hostname_lower in (
+                "okta.com",
+                "oktapreview.com",
+                "okta-emea.com",
+            ):
+                return "okta"
+            elif hostname_lower.endswith(".auth0.com") or hostname_lower == "auth0.com":
+                return "auth0"
+            elif hostname_lower.endswith(".microsoftonline.com") or hostname_lower == "microsoftonline.com":
+                return "azure"
+            elif hostname_lower.endswith(".windows.net") or hostname_lower == "windows.net":
+                return "azure"
+            elif hostname_lower.endswith(".amazoncognito.com") or hostname_lower == "amazoncognito.com":
+                # Cognito User Pool domain format: my-domain.auth.{region}.amazoncognito.com
+                return "cognito"
+            elif hostname_lower.startswith("cognito-idp.") and ".amazonaws.com" in hostname_lower:
+                # Cognito User Pool IdP format: cognito-idp.{region}.amazonaws.com
+                return "cognito"
+            elif hostname_lower == "accounts.google.com":
+                return "google"
+            else:
+                # Fail with clear error for unknown providers
+                raise ValueError(
+                    f"Unable to auto-detect provider type for domain '{domain}'. "
+                    f"Known providers: Okta, Auth0, Microsoft/Azure, AWS Cognito User Pool, Google. "
+                    f"Please check your provider domain configuration."
+                )
+        except ValueError:
+            raise
+        except Exception as e:
+            # Fail with clear error for unknown providers
+            raise ValueError(f"Unable to auto-detect provider type for domain '{domain}': {e}") from e
+
+    def _init_credential_storage(self):
+        """Initialize secure credential storage"""
+        # Check storage method from config
+        self.credential_storage = self.config.get("credential_storage", "session")
+
+        if self.credential_storage == "session":
+            # Session-based storage uses temporary files
+            self.cache_dir = Path.home() / "governed-inference-platform" / "cache"
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # For keyring, no directory setup needed
+
+    def get_cached_credentials(self):
+        """Retrieve valid credentials from configured storage"""
+        if self.credential_storage == "keyring":
+            try:
+                # On Windows, credentials are split into multiple entries due to size limits
+                if platform.system() == "Windows":
+                    # Retrieve split credentials
+                    keys_json = keyring.get_password("governed-inference-platform", f"{self.profile}-keys")
+                    token1 = keyring.get_password("governed-inference-platform", f"{self.profile}-token1")
+                    token2 = keyring.get_password("governed-inference-platform", f"{self.profile}-token2")
+                    meta_json = keyring.get_password("governed-inference-platform", f"{self.profile}-meta")
+
+                    if not all([keys_json, token1, token2, meta_json]):
+                        return None
+
+                    # Reconstruct credentials
+                    keys = json.loads(keys_json)
+                    meta = json.loads(meta_json)
+
+                    creds = {
+                        "Version": meta["Version"],
+                        "AccessKeyId": keys["AccessKeyId"],
+                        "SecretAccessKey": keys["SecretAccessKey"],
+                        "SessionToken": token1 + token2,
+                        "Expiration": meta["Expiration"],
+                    }
+                else:
+                    # Non-Windows: single entry storage
+                    creds_json = keyring.get_password("governed-inference-platform", f"{self.profile}-credentials")
+
+                    if not creds_json:
+                        return None
+
+                    creds = json.loads(creds_json)
+
+                # Check for dummy/cleared credentials first
+                # These are set when credentials are cleared to maintain keychain permissions
+                if creds.get("AccessKeyId") == "EXPIRED":
+                    self._debug_print("Found cleared dummy credentials, need re-authentication")
+                    return None
+
+                # Validate expiration for real credentials
+                exp_str = creds.get("Expiration")
+                if exp_str:
+                    exp_time = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+                    now = datetime.now(timezone.utc)
+
+                    # Use credentials if they expire in more than 30 seconds
+                    if (exp_time - now).total_seconds() > 30:
+                        return creds
+
+            except Exception as e:
+                self._debug_print(f"Error retrieving credentials from keyring: {e}")
+                return None
+        else:
+            # Session storage uses ~/.aws/credentials file
+            credentials = self.read_from_credentials_file(self.profile)
+
+            if not credentials:
+                return None
+
+            # Check for dummy/cleared credentials first
+            if credentials.get("AccessKeyId") == "EXPIRED":
+                self._debug_print("Found cleared dummy credentials in credentials file, need re-authentication")
+                return None
+
+            # Validate expiration
+            exp_str = credentials.get("Expiration")
+            if exp_str:
+                exp_time = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+                now = datetime.now(timezone.utc)
+
+                # Use credentials if they expire in more than 30 seconds
+                if (exp_time - now).total_seconds() > 30:
+                    return credentials
+
+            return None
+
+    def save_credentials(self, credentials):
+        """Save credentials to configured storage"""
+        if self.credential_storage == "keyring":
+            try:
+                # On Windows, split credentials into multiple entries due to size limits
+                # Windows Credential Manager has a 2560 byte limit, but uses UTF-16LE encoding
+                if platform.system() == "Windows":
+                    # Split the SessionToken in half
+                    token = credentials["SessionToken"]
+                    mid = len(token) // 2
+
+                    # Store as 4 separate entries
+                    keyring.set_password(
+                        "governed-inference-platform",
+                        f"{self.profile}-keys",
+                        json.dumps(
+                            {
+                                "AccessKeyId": credentials["AccessKeyId"],
+                                "SecretAccessKey": credentials["SecretAccessKey"],
+                            }
+                        ),
+                    )
+                    keyring.set_password("governed-inference-platform", f"{self.profile}-token1", token[:mid])
+                    keyring.set_password("governed-inference-platform", f"{self.profile}-token2", token[mid:])
+                    keyring.set_password(
+                        "governed-inference-platform",
+                        f"{self.profile}-meta",
+                        json.dumps({"Version": credentials["Version"], "Expiration": credentials["Expiration"]}),
+                    )
+                else:
+                    # Non-Windows: store as single entry
+                    keyring.set_password(
+                        "governed-inference-platform", f"{self.profile}-credentials", json.dumps(credentials)
+                    )
+            except Exception as e:
+                self._debug_print(f"Error saving credentials to keyring: {e}")
+                raise Exception(f"Failed to save credentials to keyring: {str(e)}") from e
+        else:
+            # Session storage uses ~/.aws/credentials file
+            self.save_to_credentials_file(credentials, self.profile)
+
+    def clear_cached_credentials(self):
+        """Clear all cached credentials for this profile"""
+        cleared_items = []
+
+        # Clear from keyring by replacing with expired credentials
+        # This maintains keychain access permissions on macOS
+        try:
+            if platform.system() == "Windows":
+                # On Windows, we have 4 separate entries to clear
+                entries_to_clear = [
+                    f"{self.profile}-keys",
+                    f"{self.profile}-token1",
+                    f"{self.profile}-token2",
+                    f"{self.profile}-meta",
+                ]
+
+                for entry in entries_to_clear:
+                    if keyring.get_password("governed-inference-platform", entry):
+                        # Replace with expired dummy data
+                        if "keys" in entry:
+                            expired_data = json.dumps({"AccessKeyId": "EXPIRED", "SecretAccessKey": "EXPIRED"})
+                        elif "token" in entry:
+                            expired_data = "EXPIRED"
+                        elif "meta" in entry:
+                            expired_data = json.dumps({"Version": 1, "Expiration": "2000-01-01T00:00:00Z"})
+                        else:
+                            expired_data = "EXPIRED"
+
+                        keyring.set_password("governed-inference-platform", entry, expired_data)
+
+                cleared_items.append("keyring credentials (Windows)")
+            else:
+                # Non-Windows: single entry storage
+                if keyring.get_password("governed-inference-platform", f"{self.profile}-credentials"):
+                    # Replace with expired dummy credential instead of deleting
+                    # This prevents macOS from asking for "Always Allow" again
+                    expired_credential = json.dumps(
+                        {
+                            "Version": 1,
+                            "AccessKeyId": "EXPIRED",
+                            "SecretAccessKey": "EXPIRED",
+                            "SessionToken": "EXPIRED",
+                            "Expiration": "2000-01-01T00:00:00Z",  # Far past date
+                        }
+                    )
+                    keyring.set_password(
+                        "governed-inference-platform", f"{self.profile}-credentials", expired_credential
+                    )
+                    cleared_items.append("keyring credentials")
+        except Exception as e:
+            self._debug_print(f"Could not clear keyring credentials: {e}")
+
+        # Clear monitoring token from keyring
+        try:
+            if platform.system() == "Windows":
+                # Chunked format: overwrite every chunk and reset the meta so the
+                # real token is not left recoverable. Also clear any legacy entry.
+                cleared_monitoring = False
+                # Reset meta to count:0 BEFORE scrubbing chunks so an interrupted clear
+                # leaves the read gated to None rather than reassembling stale chunks.
+                meta_json = keyring.get_password("governed-inference-platform", f"{self.profile}-monitoring-meta")
+                if meta_json:
+                    keyring.set_password(
+                        "governed-inference-platform",
+                        f"{self.profile}-monitoring-meta",
+                        json.dumps({"count": 0, "expires": 0, "email": "", "profile": self.profile}),
+                    )
+                    cleared_monitoring = True
+                # Scan actual chunk entries from index 1 rather than trusting
+                # meta.count: this also scrubs orphans from a larger prior token and
+                # a meta-less set left by a crash mid-save.
+                idx = 1
+                while (
+                    keyring.get_password("governed-inference-platform", f"{self.profile}-monitoring-{idx}") is not None
+                ):
+                    keyring.set_password("governed-inference-platform", f"{self.profile}-monitoring-{idx}", "EXPIRED")  # nosec B105
+                    cleared_monitoring = True
+                    idx += 1
+                # Legacy single-entry monitoring token (pre-chunk installs)
+                if keyring.get_password("governed-inference-platform", f"{self.profile}-monitoring"):
+                    keyring.set_password(
+                        "governed-inference-platform",
+                        f"{self.profile}-monitoring",
+                        json.dumps({"token": "EXPIRED", "expires": 0, "email": "", "profile": self.profile}),
+                    )
+                    cleared_monitoring = True
+                if cleared_monitoring:
+                    cleared_items.append("keyring monitoring token")
+            elif keyring.get_password("governed-inference-platform", f"{self.profile}-monitoring"):
+                # Replace with expired dummy token
+                expired_token = json.dumps(
+                    {"token": "EXPIRED", "expires": 0, "email": "", "profile": self.profile}  # Expired timestamp
+                )
+                keyring.set_password("governed-inference-platform", f"{self.profile}-monitoring", expired_token)
+                cleared_items.append("keyring monitoring token")
+        except Exception as e:
+            self._debug_print(f"Could not clear keyring monitoring token: {e}")
+
+        # Clear credentials file (for session storage mode only).
+        # Writing an EXPIRED stanza in keyring mode would shadow the profile's
+        # credential_process entry in ~/.aws/config (shared-credentials-file
+        # resolves before credential_process in the boto3 credential chain),
+        # which breaks Cowork Desktop's inferenceBedrockProfile lookup with
+        # a 403 InvalidClientTokenId.
+        if self.credential_storage == "session":
+            try:
+                credentials_path = Path.home() / ".aws" / "credentials"
+                if credentials_path.exists():
+                    expired_creds = {
+                        "Version": 1,
+                        "AccessKeyId": "EXPIRED",
+                        "SecretAccessKey": "EXPIRED",
+                        "SessionToken": "EXPIRED",
+                        "Expiration": "2000-01-01T00:00:00Z",
+                    }
+                    self.save_to_credentials_file(expired_creds, self.profile)
+                    cleared_items.append("credentials file")
+            except Exception as e:
+                self._debug_print(f"Could not clear credentials file: {e}")
+
+        # Clear monitoring token from session directory
+        session_dir = Path.home() / ".gip-session"
+        if session_dir.exists():
+            monitoring_file = session_dir / f"{self.profile}-monitoring.json"
+
+            if monitoring_file.exists():
+                monitoring_file.unlink()
+                cleared_items.append("monitoring token file")
+
+            # Remove directory if empty
+            try:
+                if not any(session_dir.iterdir()):
+                    session_dir.rmdir()
+            except Exception:
+                pass  # nosec B110
+
+        return cleared_items
+
+    def _clear_sts_credentials(self):
+        """Clear only STS credentials cache, preserving monitoring token for silent refresh."""
+        try:
+            if self.credential_storage == "keyring":
+                if platform.system() == "Windows":
+                    for entry in [
+                        f"{self.profile}-keys",
+                        f"{self.profile}-token1",
+                        f"{self.profile}-token2",
+                        f"{self.profile}-meta",
+                    ]:
+                        if keyring.get_password("governed-inference-platform", entry):
+                            if "keys" in entry:
+                                expired_data = json.dumps({"AccessKeyId": "EXPIRED", "SecretAccessKey": "EXPIRED"})
+                            elif "meta" in entry:
+                                expired_data = json.dumps({"Version": 1, "Expiration": "2000-01-01T00:00:00Z"})
+                            else:
+                                expired_data = "EXPIRED"
+                            keyring.set_password("governed-inference-platform", entry, expired_data)
+                else:
+                    if keyring.get_password("governed-inference-platform", f"{self.profile}-credentials"):
+                        expired_credential = json.dumps(
+                            {
+                                "Version": 1,
+                                "AccessKeyId": "EXPIRED",
+                                "SecretAccessKey": "EXPIRED",
+                                "SessionToken": "EXPIRED",
+                                "Expiration": "2000-01-01T00:00:00Z",
+                            }
+                        )
+                        keyring.set_password(
+                            "governed-inference-platform", f"{self.profile}-credentials", expired_credential
+                        )
+            # Clear session file credentials (but NOT monitoring token file)
+            session_dir = Path.home() / ".gip-session"
+            creds_file = session_dir / f"{self.profile}-credentials.json"
+            if creds_file.exists():
+                creds_file.unlink()
+
+            # For session storage mode, also clear ~/.aws/credentials
+            if self.credential_storage == "session":
+                expired_creds = {
+                    "Version": 1,
+                    "AccessKeyId": "EXPIRED",
+                    "SecretAccessKey": "EXPIRED",
+                    "SessionToken": "EXPIRED",
+                    "Expiration": "2000-01-01T00:00:00Z",
+                }
+                self.save_to_credentials_file(expired_creds, self.profile)
+
+            self._debug_print("Cleared STS credentials (monitoring token preserved)")
+        except Exception as e:
+            self._debug_print(f"Could not clear STS credentials: {e}")
+
+    # Per-entry chunk size for the Windows monitoring-token split. Windows
+    # Credential Manager caps a single entry at CRED_MAX_CREDENTIAL_BLOB_SIZE
+    # (5*512 = 2560 bytes), and the keyring backend stores values as UTF-16LE
+    # (2 bytes/char), so the practical limit is ~1280 chars. A real Azure
+    # id_token (~1.3KB) exceeds this, so it must be split. 1000 leaves headroom.
+    _MONITORING_CHUNK_SIZE = 1000
+
+    def _save_monitoring_keyring_windows(self, token_data):
+        """Persist the monitoring token to Windows keyring as N size-bounded chunks.
+
+        A single Credential Manager entry cannot hold a full id_token (see
+        _MONITORING_CHUNK_SIZE), so the token string is split across
+        {profile}-monitoring-1..N entries with a {profile}-monitoring-meta entry
+        holding the chunk count plus small fields (expires/email/profile) that
+        callers need without reassembling the token.
+        """
+        token = token_data["token"]
+        size = self._MONITORING_CHUNK_SIZE
+        chunks = [token[i : i + size] for i in range(0, len(token), size)] or [""]
+
+        written = []
+        try:
+            for idx, chunk in enumerate(chunks, start=1):
+                entry = f"{self.profile}-monitoring-{idx}"
+                keyring.set_password("governed-inference-platform", entry, chunk)
+                written.append(entry)
+            keyring.set_password(
+                "governed-inference-platform",
+                f"{self.profile}-monitoring-meta",
+                json.dumps(
+                    {
+                        "count": len(chunks),
+                        "expires": token_data.get("expires", 0),
+                        "email": token_data.get("email", ""),
+                        "profile": token_data.get("profile", self.profile),
+                    }
+                ),
+            )
+        except Exception:
+            # Roll back any partial write so a later read can't reassemble a
+            # truncated token (the all-or-nothing read guard also covers this).
+            for entry in written:
+                try:
+                    keyring.delete_password("governed-inference-platform", entry)
+                except Exception:
+                    pass  # nosec B110
+            raise
+
+        # Purge orphaned higher-index chunks left by a previous, larger token so no
+        # plaintext tail survives a shrink. Chunks are written contiguously 1..N, so
+        # scanning until the first gap is safe.
+        try:
+            idx = len(chunks) + 1
+            while keyring.get_password("governed-inference-platform", f"{self.profile}-monitoring-{idx}") is not None:
+                keyring.delete_password("governed-inference-platform", f"{self.profile}-monitoring-{idx}")
+                idx += 1
+        except Exception:
+            pass  # nosec B110
+
+        # Remove a legacy single-entry monitoring token so stale data can't shadow
+        # the chunked entries on read.
+        try:
+            if keyring.get_password("governed-inference-platform", f"{self.profile}-monitoring"):
+                keyring.delete_password("governed-inference-platform", f"{self.profile}-monitoring")
+        except Exception:
+            pass  # nosec B110
+
+    def _read_monitoring_keyring_windows(self):
+        """Reassemble the monitoring token from Windows keyring chunks.
+
+        Returns the token_data dict, or None if no valid chunk set is present.
+        Falls back to a legacy single {profile}-monitoring entry for installs
+        that predate the chunked format.
+        """
+        meta_json = keyring.get_password("governed-inference-platform", f"{self.profile}-monitoring-meta")
+        if not meta_json:
+            # Backward compatibility: try the legacy single-entry format.
+            legacy = keyring.get_password("governed-inference-platform", f"{self.profile}-monitoring")
+            if not legacy:
+                return None
+            return json.loads(legacy)
+
+        meta = json.loads(meta_json)
+        count = meta.get("count", 0)
+        if not count:
+            return None
+
+        chunks = []
+        for idx in range(1, count + 1):
+            chunk = keyring.get_password("governed-inference-platform", f"{self.profile}-monitoring-{idx}")
+            # All-or-nothing guard: a missing chunk means an incomplete/partial
+            # write; never return a truncated token.
+            if chunk is None:
+                return None
+            chunks.append(chunk)
+
+        return {
+            "token": "".join(chunks),
+            "expires": meta.get("expires", 0),
+            "email": meta.get("email", ""),
+            "profile": meta.get("profile", self.profile),
+        }
+
+    def save_monitoring_token(self, id_token, token_claims):
+        """Save ID token for monitoring authentication"""
+        try:
+            # Extract relevant claims
+            token_data = {
+                "token": id_token,
+                "expires": token_claims.get("exp", 0),
+                "email": token_claims.get("email", ""),
+                "profile": self.profile,
+            }
+
+            if self.credential_storage == "keyring":
+                if platform.system() == "Windows":
+                    # Windows Credential Manager rejects a full id_token in one
+                    # entry (~1280 char limit); split into chunks. See
+                    # _save_monitoring_keyring_windows.
+                    self._save_monitoring_keyring_windows(token_data)
+                else:
+                    # macOS Keychain / Secret Service have no small per-entry
+                    # limit; store as a single entry.
+                    keyring.set_password(
+                        "governed-inference-platform", f"{self.profile}-monitoring", json.dumps(token_data)
+                    )
+            else:
+                # Save to session directory alongside credentials
+                session_dir = Path.home() / ".gip-session"
+                session_dir.mkdir(parents=True, exist_ok=True)
+
+                # Use simple session file per profile
+                token_file = session_dir / f"{self.profile}-monitoring.json"
+
+                with open(token_file, "w", encoding="utf-8") as f:
+                    json.dump(token_data, f)
+                token_file.chmod(0o600)
+
+            # Also export to environment for this session
+            os.environ["GIP_MONITORING_TOKEN"] = id_token
+
+            self._debug_print(f"Saved monitoring token for {token_claims.get('email', 'user')}")
+        except Exception as e:
+            # Non-fatal error - monitoring is optional
+            self._debug_print(f"Warning: Could not save monitoring token: {e}")
+
+    def _load_monitoring_token_data(self):
+        """Load the raw monitoring-token blob from configured storage, or None.
+
+        Returns the parsed dict (with "token"/"expires") WITHOUT applying the
+        expiry check, so callers can tell "absent" apart from "present but
+        expired". Does not consult GIP_MONITORING_TOKEN (that path
+        carries no expiry metadata).
+        """
+        try:
+            if self.credential_storage == "keyring":
+                if platform.system() == "Windows":
+                    # Reassemble from chunked entries (with legacy fallback).
+                    token_data = self._read_monitoring_keyring_windows()
+                    if not token_data:
+                        return None
+                else:
+                    # Retrieve from keyring (single entry on macOS/Linux)
+                    token_json = keyring.get_password("governed-inference-platform", f"{self.profile}-monitoring")
+
+                    if not token_json:
+                        return None
+
+                    token_data = json.loads(token_json)
+            else:
+                # Check session file
+                session_dir = Path.home() / ".gip-session"
+                token_file = session_dir / f"{self.profile}-monitoring.json"
+
+                if not token_file.exists():
+                    return None
+
+                with open(token_file, encoding="utf-8") as f:
+                    token_data = json.load(f)
+
+            return token_data
+        except Exception:
+            return None
+
+    def get_monitoring_token(self):
+        """Retrieve valid monitoring token from configured storage"""
+        try:
+            # First check if it's in environment (from current session)
+            import os
+
+            env_token = os.environ.get("GIP_MONITORING_TOKEN")
+            if env_token:
+                return env_token
+
+            token_data = self._load_monitoring_token_data()
+            if not token_data:
+                return None
+
+            # Check expiration
+            exp_time = token_data.get("expires", 0)
+            now = int(datetime.now(timezone.utc).timestamp())
+
+            # Return token if it expires in more than 60 seconds
+            if exp_time - now > 60:
+                token = token_data["token"]
+                # Set in environment for this session
+                os.environ["GIP_MONITORING_TOKEN"] = token
+                return token
+
+            return None
+        except Exception:
+            return None
+
+    def get_mcp_auth_header(self):
+        """Return the MCP Authorization header dict from the cached id_token, or None.
+
+        {"Authorization": "Bearer <id_token>"} for the AgentCore web-search MCP
+        headersHelper. Reads only the cached token via get_monitoring_token() —
+        never opens a browser. Returns None when no valid token is available so
+        the caller fails cleanly (no hang, no prompt).
+
+        NOTE (Go/Python asymmetry): the Go credential-process silently re-mints
+        an expired id_token via a browserless refresh_token exchange
+        (refreshIDTokenOnly) before giving up. The Python provider has no
+        refresh_token store, so it cannot do that here — a present-but-expired
+        token surfaces as None. We emit a one-line stderr hint distinguishing
+        "expired" from "never authenticated" so the failure is diagnosable, then
+        rely on the next full credential-process run (which Claude Code invokes
+        routinely) to re-mint and re-cache the token. Full silent-refresh parity
+        is a larger cross-cutting change tracked separately.
+        """
+        token = self.get_monitoring_token()
+        if token:
+            return {"Authorization": f"Bearer {token}"}
+
+        # Distinguish expired-but-present from absent for a useful diagnostic.
+        token_data = self._load_monitoring_token_data()
+        if token_data and token_data.get("token"):
+            print(
+                f"Note: cached token for profile '{self.profile}' is expired; "
+                "re-run the credential process to refresh it.",
+                file=sys.stderr,
+            )
+        return None
+
+    def save_to_credentials_file(self, credentials, profile="gip"):
+        """Save credentials to ~/.aws/credentials file
+
+        Args:
+            credentials: Dict with AccessKeyId, SecretAccessKey, SessionToken, Expiration
+            profile: Profile name to use in credentials file (default: gip)
+        """
+        import tempfile
+        from configparser import ConfigParser
+
+        credentials_path = Path.home() / ".aws" / "credentials"
+
+        # Create ~/.aws directory if it doesn't exist
+        credentials_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Read existing file or create new config
+        # Disable inline comment characters so we can use keys like 'x-expiration'
+        config = ConfigParser(inline_comment_prefixes=())
+        if credentials_path.exists():
+            try:
+                config.read(credentials_path)
+            except Exception as e:
+                self._debug_print(f"Warning: Could not read existing credentials file: {e}")
+
+        # Update profile section
+        if profile not in config:
+            config[profile] = {}
+
+        config[profile]["aws_access_key_id"] = credentials["AccessKeyId"]
+        config[profile]["aws_secret_access_key"] = credentials["SecretAccessKey"]
+        config[profile]["aws_session_token"] = credentials["SessionToken"]
+
+        # Add expiration as a special key that AWS SDK will ignore
+        # Use 'x-' prefix which is a convention for custom/extension fields
+        if "Expiration" in credentials:
+            config[profile]["x-expiration"] = credentials["Expiration"]
+
+        # Atomic write using temporary file
+        try:
+            # Write to temporary file first
+            temp_fd, temp_path = tempfile.mkstemp(dir=credentials_path.parent, prefix=".credentials.", suffix=".tmp")
+
+            try:
+                with os.fdopen(temp_fd, "w") as f:
+                    config.write(f)
+
+                # Set restrictive permissions on temp file
+                os.chmod(temp_path, 0o600)
+
+                # Atomic rename
+                os.replace(temp_path, credentials_path)
+
+                self._debug_print(f"Saved credentials to {credentials_path} for profile '{profile}'")
+            except Exception:
+                # Clean up temp file on error
+                try:
+                    os.unlink(temp_path)
+                except Exception:
+                    pass  # nosec B110
+                raise
+        except Exception as e:
+            raise Exception(f"Failed to save credentials to file: {str(e)}") from e
+
+    def read_from_credentials_file(self, profile="gip"):
+        """Read credentials from ~/.aws/credentials file
+
+        Args:
+            profile: Profile name to read from credentials file
+
+        Returns:
+            Dict with credentials or None if not found
+        """
+        from configparser import ConfigParser
+
+        credentials_path = Path.home() / ".aws" / "credentials"
+
+        if not credentials_path.exists():
+            return None
+
+        try:
+            # Disable inline comment characters to read keys like 'x-expiration'
+            config = ConfigParser(inline_comment_prefixes=())
+            config.read(credentials_path)
+
+            if profile not in config:
+                return None
+
+            profile_section = config[profile]
+
+            # Build credentials dict
+            credentials = {
+                "Version": 1,
+                "AccessKeyId": profile_section.get("aws_access_key_id"),
+                "SecretAccessKey": profile_section.get("aws_secret_access_key"),
+                "SessionToken": profile_section.get("aws_session_token"),
+            }
+
+            # Extract expiration from custom field if present
+            expiration = profile_section.get("x-expiration")
+            if expiration:
+                credentials["Expiration"] = expiration
+
+            # Validate all required fields are present
+            if not all(
+                [credentials.get("AccessKeyId"), credentials.get("SecretAccessKey"), credentials.get("SessionToken")]
+            ):
+                return None
+
+            return credentials
+
+        except Exception as e:
+            self._debug_print(f"Error reading credentials from file: {e}")
+            return None
+
+    def check_credentials_file_expiration(self, profile="gip"):
+        """Check if credentials in file are expired
+
+        Args:
+            profile: Profile name to check
+
+        Returns:
+            True if expired, False if valid
+        """
+        credentials = self.read_from_credentials_file(profile)
+
+        if not credentials:
+            return True  # No credentials = expired
+
+        exp_str = credentials.get("Expiration")
+        if not exp_str:
+            # No expiration info, assume expired for safety
+            return True
+
+        try:
+            exp_time = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+
+            # Use 30-second buffer - consider expired if less than 30s remaining
+            remaining_seconds = (exp_time - now).total_seconds()
+            return remaining_seconds <= 30
+
+        except Exception as e:
+            self._debug_print(f"Error parsing expiration: {e}")
+            return True  # Assume expired on parse error
+
+    def _build_client_assertion(self, token_url: str) -> str:
+        """Build a signed JWT client assertion for certificate-based confidential client auth.
+
+        Used by Azure AD / Entra ID when 'Allow public client flows' is disabled.
+        Follows the Microsoft identity platform certificate credentials specification:
+        https://learn.microsoft.com/en-us/entra/identity-platform/certificate-credentials
+
+        Args:
+            token_url: The token endpoint URL, used as the JWT audience.
+
+        Returns:
+            A signed JWT string to be sent as client_assertion.
+        """
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+
+        # Env vars take precedence over config.json so paths stay portable across
+        # machines (self-install and admin-push scenarios).  This follows the
+        # Azure SDK convention for AZURE_CLIENT_CERTIFICATE_PATH.
+        cert_path = Path(
+            os.environ.get("AZURE_CLIENT_CERTIFICATE_PATH") or self.config["client_certificate_path"]
+        ).expanduser()
+        key_path = Path(
+            os.environ.get("AZURE_CLIENT_CERTIFICATE_KEY_PATH") or self.config["client_certificate_key_path"]
+        ).expanduser()
+
+        if not cert_path.exists():
+            raise FileNotFoundError(
+                f"Certificate file not found: {cert_path}\n"
+                "Set the AZURE_CLIENT_CERTIFICATE_PATH environment variable to the correct path, "
+                "or update 'client_certificate_path' in config.json."
+            )
+        if not key_path.exists():
+            raise FileNotFoundError(
+                f"Private key file not found: {key_path}\n"
+                "Set the AZURE_CLIENT_CERTIFICATE_KEY_PATH environment variable to the correct path, "
+                "or update 'client_certificate_key_path' in config.json."
+            )
+
+        cert_pem = cert_path.read_bytes()
+        key_pem = key_path.read_bytes()
+
+        cert = x509.load_pem_x509_certificate(cert_pem)
+        private_key = serialization.load_pem_private_key(key_pem, password=None)
+
+        # SHA-256 thumbprint of the DER-encoded certificate (x5t#S256 header)
+        # Per Microsoft Entra ID recommendation: https://learn.microsoft.com/en-us/entra/identity-platform/certificate-credentials
+        thumbprint = cert.fingerprint(hashes.SHA256())
+        x5t_s256 = base64.urlsafe_b64encode(thumbprint).rstrip(b"=").decode()
+
+        now = int(time.time())
+        payload = {
+            "aud": token_url,
+            "iss": self.config["client_id"],
+            "sub": self.config["client_id"],
+            "jti": secrets.token_urlsafe(16),
+            "nbf": now,
+            "iat": now,
+            "exp": now + 300,  # 5-minute lifetime
+        }
+
+        # PyJWT encodes using the private key; headers must include x5t#S256
+        token = jwt.encode(
+            payload,
+            private_key,
+            algorithm="PS256",
+            headers={"x5t#S256": x5t_s256},
+        )
+        return token
+
+    def authenticate_oidc(self, lock_socket=None):
+        """Perform OIDC authentication with PKCE.
+
+        Args:
+            lock_socket: An optional socket already bound to the redirect port by
+                the caller's lock check. Reusing it keeps the port continuously
+                held from the lock check through the callback, closing the TOCTOU
+                window where a concurrent credential-process could bind the freed
+                port and open a second browser. If None, a fresh server socket is
+                bound here (legacy behavior).
+        """
+        state = secrets.token_urlsafe(16)
+        nonce = secrets.token_urlsafe(16)
+
+        # Generate PKCE parameters
+        code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("utf-8").rstrip("=")
+        code_challenge = (
+            base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("utf-8")).digest()).decode("utf-8").rstrip("=")
+        )
+
+        # Build authorization URL based on provider
+        provider_domain = self.config["provider_domain"]
+
+        # For Azure/Microsoft, if domain includes /v2.0, we need to strip it
+        # since the endpoints already include the full path
+        if self.provider_type == "azure" and provider_domain.endswith("/v2.0"):
+            provider_domain = provider_domain[:-5]  # Remove '/v2.0'
+
+        # For Cognito User Pool, we need to extract the domain and construct the URL differently
+        if self.provider_type == "cognito":
+            # Domain format: cognito-idp.{region}.amazonaws.com/{user-pool-id}
+            # OAuth2 endpoints are at: https://{user-pool-domain}.auth.{region}.amazoncognito.com
+            # We need the User Pool domain (configured separately in Cognito console)
+            # For now, we'll use the domain as provided, which should be the User Pool domain
+            if "amazoncognito.com" not in provider_domain:
+                # If it's the identity pool format, we need the actual User Pool domain
+                raise ValueError(
+                    "For Cognito User Pool, please provide the User Pool domain "
+                    "(e.g., 'my-domain.auth.us-east-1.amazoncognito.com'), "
+                    "not the identity pool endpoint."
+                )
+            base_url = f"https://{provider_domain}"
+        else:
+            base_url = f"https://{provider_domain}"
+
+        auth_params = {
+            "client_id": self.config["client_id"],
+            "response_type": self.provider_config["response_type"],
+            "scope": self.provider_config["scopes"],
+            "redirect_uri": self.redirect_uri,
+            "state": state,
+            "nonce": nonce,
+            "code_challenge_method": "S256",
+            "code_challenge": code_challenge,
+        }
+
+        # Add provider-specific parameters
+        if self.provider_type == "azure":
+            auth_params["response_mode"] = "query"
+            prompt = self.config.get("oidc_prompt", "select_account")
+            if prompt:
+                auth_params["prompt"] = prompt
+
+        # For generic OIDC, the profile carries full endpoint URLs since path layout varies by IdP.
+        # Other providers use the hardcoded paths in PROVIDER_CONFIGS appended to the base URL.
+        configured_authorize = self.config.get("oidc_authorization_endpoint")
+        if configured_authorize:
+            authorize_url = configured_authorize
+        else:
+            authorize_url = f"{base_url}{self.provider_config['authorize_endpoint']}"
+        auth_url = f"{authorize_url}?" + urlencode(auth_params)
+
+        # Setup callback server
+        auth_result = {"code": None, "error": None}
+        handler = self._create_callback_handler(state, auth_result)
+        if lock_socket is not None:
+            # Reuse the caller's already-bound lock socket so the port is never
+            # released between the lock check and the callback (no TOCTOU gap).
+            server = HTTPServer(("127.0.0.1", self.redirect_port), handler, bind_and_activate=False)
+            # Close the default socket created by TCPServer.__init__ to avoid fd leak
+            server.socket.close()
+            server.socket = lock_socket
+            lock_socket.listen(5)
+        else:
+            server = HTTPServer(("127.0.0.1", self.redirect_port), handler)
+
+        # Start server in background
+        server_thread = threading.Thread(target=server.handle_request)
+        server_thread.daemon = True
+        server_thread.start()
+
+        # Open browser
+        self._debug_print(f"Opening browser for {self.provider_config['name']} authentication...")
+        self._debug_print(f"If browser doesn't open, visit: {auth_url}")
+        webbrowser.open(auth_url)
+
+        # Wait for callback
+        server_thread.join(timeout=300)  # 5 minute timeout
+
+        if auth_result["error"]:
+            raise Exception(f"Authentication error: {auth_result['error']}")
+
+        if not auth_result["code"]:
+            raise Exception("Authentication timeout - no authorization code received")
+
+        # Exchange code for tokens
+        token_data = {
+            "grant_type": "authorization_code",
+            "code": auth_result["code"],
+            "redirect_uri": self.redirect_uri,
+            "client_id": self.config["client_id"],
+            "code_verifier": code_verifier,
+        }
+
+        # Build token endpoint URL (configured value wins for generic OIDC)
+        configured_token = self.config.get("oidc_token_endpoint")
+        token_endpoint = self.provider_config["token_endpoint"]
+        if configured_token:
+            token_url = configured_token
+        elif token_endpoint.startswith("https://"):
+            token_url = token_endpoint
+        else:
+            token_url = f"{base_url}{token_endpoint}"
+
+        # Confidential client: inject client_secret or certificate assertion
+        if self.config.get("client_certificate_path") and self.config.get("client_certificate_key_path"):
+            token_data["client_assertion_type"] = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+            token_data["client_assertion"] = self._build_client_assertion(token_url)
+        elif self.config.get("client_secret"):
+            token_data["client_secret"] = self.config["client_secret"]
+        else:
+            azure_auth_mode = self.config.get("azure_auth_mode")
+            if azure_auth_mode == "certificate":
+                raise ValueError(
+                    "azure_auth_mode is 'certificate' but no certificate paths are configured. "
+                    "Set AZURE_CLIENT_CERTIFICATE_PATH and AZURE_CLIENT_CERTIFICATE_KEY_PATH, "
+                    "or update 'client_certificate_path' and 'client_certificate_key_path' in config.json."
+                )
+            if azure_auth_mode == "secret":
+                raise ValueError(
+                    "azure_auth_mode is 'secret' but no client secret is stored. "
+                    f"Run: credential-process --set-client-secret --profile {self.profile}"
+                )
+
+        token_response = requests.post(
+            token_url,
+            data=token_data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=30,  # 30 second timeout for token exchange
+        )
+
+        if not token_response.ok:
+            raise Exception(f"Token exchange failed: {token_response.text}")
+
+        tokens = token_response.json()
+
+        # Validate nonce in ID token (if provider includes it)
+        # Signature verification is intentionally skipped here: this token was
+        # just received directly from the IdP token endpoint over TLS via the
+        # authorization-code + PKCE exchange (OIDC Core 3.1.3.7 permits TLS
+        # channel validation in this flow). Claims are used only for the nonce
+        # check and session naming; authorization happens at STS
+        # AssumeRoleWithWebIdentity (get_aws_credentials), which verifies the
+        # token signature against the issuer's JWKS server-side.
+        id_token_claims = jwt.decode(tokens["id_token"], **_CLAIMS_ONLY_DECODE_KWARGS)
+        if "nonce" in id_token_claims and id_token_claims.get("nonce") != nonce:
+            raise Exception("Invalid nonce in ID token")
+
+        # Enhanced debug logging for claims
+        if self.debug:
+            self._debug_print("\n=== ID Token Claims ===")
+            self._debug_print(json.dumps(id_token_claims, indent=2, default=str))
+
+            # Log specific important claims
+            important_claims = [
+                "sub",
+                "email",
+                "name",
+                "preferred_username",
+                "groups",
+                "cognito:groups",
+                "custom:department",
+                "custom:role",
+            ]
+            self._debug_print("\n=== Key Claims for Mapping ===")
+            for claim in important_claims:
+                if claim in id_token_claims:
+                    self._debug_print(f"{claim}: {id_token_claims[claim]}")
+
+        return tokens["id_token"], id_token_claims
+
+    def _create_callback_handler(self, expected_state, result_container):
+        """Create HTTP handler for OAuth callback"""
+        parent = self
+
+        class CallbackHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                parent._debug_print(f"Received callback request: {self.path}")
+                query = parse_qs(urlparse(self.path).query)
+
+                if query.get("error"):
+                    result_container["error"] = query.get("error_description", ["Unknown error"])[0]
+                    self._send_response(400, "Authentication failed")
+                elif query.get("state", [""])[0] == expected_state and "code" in query:
+                    result_container["code"] = query["code"][0]
+                    self._send_response(200, "Authentication successful! You can close this window.")
+                else:
+                    result_container["error"] = "Invalid state or missing code"
+                    self._send_response(400, "Invalid response")
+
+            def _send_response(self, code, message):
+                self.send_response(code)
+                self.send_header("Content-type", "text/html; charset=utf-8")
+                self.end_headers()
+                html = f"""
+                <html>
+                <head><title>Authentication</title></head>
+                <body style="font-family: sans-serif; text-align: center; padding: 50px;">
+                    <h1>{message}</h1>
+                    <p>Return to your terminal to continue.</p>
+                </body>
+                </html>
+                """
+                self.wfile.write(html.encode())
+
+            def log_message(self, format, *args):
+                pass  # Suppress logs
+
+        return CallbackHandler
+
+    def get_aws_credentials(self, id_token, token_claims):
+        """Exchange OIDC token for AWS credentials"""
+        self._debug_print("Entering get_aws_credentials method")
+
+        # Route to appropriate federation method
+        federation_type = self.config.get("federation_type", "cognito")
+        self._debug_print(f"Using federation type: {federation_type}")
+
+        if federation_type == "direct":
+            return self.get_aws_credentials_direct(id_token, token_claims)
+        else:
+            return self.get_aws_credentials_cognito(id_token, token_claims)
+
+    def get_aws_credentials_direct(self, id_token, token_claims):
+        """Direct STS federation without Cognito Identity Pool - provides 12 hour sessions"""
+        self._debug_print("Using Direct STS federation (AssumeRoleWithWebIdentity)")
+
+        # Clear any AWS credentials to prevent recursive calls
+        env_vars_to_clear = ["AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]
+        saved_env = {}
+        for var in env_vars_to_clear:
+            if var in os.environ:
+                saved_env[var] = os.environ[var]
+                del os.environ[var]
+
+        try:
+            # Get the federated role ARN from config
+            federated_role_arn = self.config.get("federated_role_arn")
+            if not federated_role_arn:
+                raise ValueError("federated_role_arn is required for direct STS federation")
+
+            # Create STS client
+            sts_client = boto3.client("sts", region_name=self.config["aws_region"])
+
+            # Generate session name from user identifier
+            # AWS RoleSessionName regex: [\w+=,.@-]*, max 64 chars
+            # Auth0 often uses pipe-delimited format in sub claims (e.g., auth0|12345)
+            # Sanitize to replace invalid characters with hyphens
+            session_name = "gip"
+            if "email" in token_claims:
+                # Use full email for human-readable CUR cost attribution.
+                # The principal ARN (assumed-role/RoleName/alice@acme.com) appears
+                # in CUR line_item_iam_principal, enabling per-user cost visibility
+                # without requiring session tags.
+                session_name = re.sub(r"[^\w+=,.@-]", "-", str(token_claims["email"]))[:64]
+            elif "sub" in token_claims:
+                # Fallback to sub when email is not available (e.g. some Entra ID configs)
+                sub_sanitized = re.sub(r"[^\w+=,.@-]", "-", str(token_claims["sub"])[:32])
+                session_name = f"gip-{sub_sanitized}"
+
+            self._debug_print(f"Assuming role: {federated_role_arn}")
+            self._debug_print(f"Session name: {session_name}")
+
+            # Call AssumeRoleWithWebIdentity
+            # Note: AssumeRoleWithWebIdentity does not support a Tags parameter.
+            # Session tags must be embedded in the JWT by the IdP as the
+            # https://aws.amazon.com/tags claim. Use the Cognito Identity Pool
+            # path (FederationType=cognito) for automatic tag mapping via
+            # PrincipalTags without IdP-side configuration.
+            assume_role_params = {
+                "RoleArn": federated_role_arn,
+                "RoleSessionName": session_name,
+                "WebIdentityToken": id_token,
+                "DurationSeconds": self.config.get("max_session_duration", 43200),  # 12 hours
+            }
+
+            response = sts_client.assume_role_with_web_identity(**assume_role_params)
+
+            # Extract credentials
+            creds = response["Credentials"]
+
+            # Format for AWS CLI
+            formatted_creds = {
+                "Version": 1,
+                "AccessKeyId": creds["AccessKeyId"],
+                "SecretAccessKey": creds["SecretAccessKey"],
+                "SessionToken": creds["SessionToken"],
+                "Expiration": (
+                    creds["Expiration"].isoformat()
+                    if hasattr(creds["Expiration"], "isoformat")
+                    else creds["Expiration"]
+                ),
+            }
+
+            self._debug_print(
+                f"Successfully obtained credentials via Direct STS, expires: {formatted_creds['Expiration']}"
+            )
+            return formatted_creds
+
+        except Exception as e:
+            # Check if this is a credential error that suggests bad cached credentials
+            error_str = str(e)
+            if any(
+                err in error_str
+                for err in [
+                    "InvalidParameterException",
+                    "NotAuthorizedException",
+                    "ValidationError",
+                    "Invalid AccessKeyId",
+                    "ExpiredToken",
+                    "Invalid JWT",
+                ]
+            ):
+                self._debug_print("Detected invalid credentials, clearing cache...")
+                self.clear_cached_credentials()
+                # Add helpful message for user
+                raise Exception(
+                    f"Authentication failed - cached credentials were invalid and have been cleared.\n"
+                    f"Please try again to re-authenticate.\n"
+                    f"Original error: {error_str}"
+                ) from e
+            raise Exception(f"Failed to get AWS credentials via Direct STS: {str(e)}") from None
+        finally:
+            # Restore environment variables
+            for var, value in saved_env.items():
+                os.environ[var] = value
+
+    def get_aws_credentials_cognito(self, id_token, token_claims):
+        """Exchange OIDC token for AWS credentials via Cognito Identity Pool"""
+        self._debug_print("Using Cognito Identity Pool federation")
+
+        # Clear any AWS credentials to prevent recursive calls
+        env_vars_to_clear = ["AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]
+        saved_env = {}
+        for var in env_vars_to_clear:
+            if var in os.environ:
+                saved_env[var] = os.environ[var]
+                del os.environ[var]
+
+        try:
+            # Use unsigned requests for Cognito Identity (no AWS credentials needed)
+            self._debug_print("Creating Cognito Identity client...")
+            cognito_client = boto3.client(
+                "cognito-identity", region_name=self.config["aws_region"], config=Config(signature_version=UNSIGNED)
+            )
+            self._debug_print("Cognito client created")
+
+            self._debug_print("Creating STS client...")
+            boto3.client("sts", region_name=self.config["aws_region"])
+            self._debug_print("STS client created")
+        finally:
+            # Restore environment variables
+            for var, value in saved_env.items():
+                os.environ[var] = value
+
+        try:
+            # Log authentication details for debugging
+            self._debug_print(f"Provider type: {self.provider_type}")
+            self._debug_print(f"AWS Region: {self.config['aws_region']}")
+            self._debug_print(f"Identity Pool ID: {self.config['identity_pool_id']}")
+
+            # Determine the correct login key based on provider type
+            if self.provider_type == "cognito":
+                # For Cognito User Pool, extract from token issuer to ensure case matches
+                if "iss" in token_claims:
+                    # Use the issuer from the token to ensure case matches
+                    issuer = token_claims["iss"]
+                    login_key = issuer.replace("https://", "")
+                    self._debug_print("Using issuer from token as login key")
+                else:
+                    # Fallback: construct from config
+                    user_pool_id = self.config.get("cognito_user_pool_id")
+                    if not user_pool_id:
+                        raise ValueError("cognito_user_pool_id is required for Cognito User Pool authentication")
+                    login_key = f"cognito-idp.{self.config['aws_region']}.amazonaws.com/{user_pool_id}"
+                    self._debug_print(f"Cognito User Pool ID from config: {user_pool_id}")
+            else:
+                # For external OIDC providers, use the provider domain
+                login_key = self.config["provider_domain"]
+
+            self._debug_print(f"Login key: {login_key}")
+            self._debug_print(f"Token claims: {list(token_claims.keys())}")
+            if "iss" in token_claims:
+                self._debug_print(f"Token issuer: {token_claims['iss']}")
+
+            # Log all claims being passed for principal tags
+            if self.debug:
+                self._debug_print("\n=== Claims being sent to Cognito Identity ===")
+                self._debug_print(f"Provider: {login_key}")
+                self._debug_print("Claims that could be mapped to principal tags:")
+                for key, value in token_claims.items():
+                    self._debug_print(f"  {key}: {value}")
+
+            # Get Cognito identity
+            self._debug_print(f"Calling GetId with identity pool: {self.config['identity_pool_id']}")
+            identity_response = cognito_client.get_id(
+                IdentityPoolId=self.config["identity_pool_id"], Logins={login_key: id_token}
+            )
+
+            identity_id = identity_response["IdentityId"]
+            self._debug_print(f"Got Cognito Identity ID: {identity_id}")
+
+            # For enhanced flow, directly get credentials
+            # Since we have a specific role configured, we'll use the role-based approach
+            role_arn = self.config.get("role_arn")
+            self._debug_print(f"Configured role ARN: {role_arn if role_arn else 'None (using default pool role)'}")
+
+            if role_arn:
+                # Get credentials for identity first to get the OIDC token
+                credentials_response = cognito_client.get_credentials_for_identity(
+                    IdentityId=identity_id, Logins={login_key: id_token}
+                )
+
+                # The credentials from Cognito are temporary credentials for the default role
+                # Since we want to use our specific role with session tags, we need to do AssumeRole
+                creds = credentials_response["Credentials"]
+            else:
+                # Get default role from identity pool
+                credentials_response = cognito_client.get_credentials_for_identity(
+                    IdentityId=identity_id, Logins={login_key: id_token}
+                )
+
+                creds = credentials_response["Credentials"]
+
+            # Format for AWS CLI
+            formatted_creds = {
+                "Version": 1,
+                "AccessKeyId": creds["AccessKeyId"],
+                "SecretAccessKey": creds["SecretKey"],
+                "SessionToken": creds["SessionToken"],
+                "Expiration": (
+                    creds["Expiration"].isoformat()
+                    if hasattr(creds["Expiration"], "isoformat")
+                    else creds["Expiration"]
+                ),
+            }
+
+            return formatted_creds
+
+        except Exception as e:
+            # Check if this is a credential error that suggests bad cached credentials
+            error_str = str(e)
+            if any(
+                err in error_str
+                for err in [
+                    "InvalidParameterException",
+                    "NotAuthorizedException",
+                    "ValidationError",
+                    "Invalid AccessKeyId",
+                    "Token is not from a supported provider",
+                ]
+            ):
+                self._debug_print("Detected invalid credentials, clearing cache...")
+                self.clear_cached_credentials()
+                # Add helpful message for user
+                raise Exception(
+                    f"Authentication failed - cached credentials were invalid and have been cleared.\n"
+                    f"Please try again to re-authenticate.\n"
+                    f"Original error: {error_str}"
+                ) from e
+            raise Exception(f"Failed to get AWS credentials: {str(e)}") from None
+
+    def authenticate_for_monitoring(self):
+        """Authenticate specifically for monitoring token (no AWS credential output)"""
+        try:
+            # Try to acquire port lock by testing if we can bind to it.
+            # Keep the socket BOUND (don't close it) so the port is held
+            # continuously through authenticate_oidc — see run() for the rationale.
+            lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # SO_REUSEADDR lets a TIME_WAIT socket be rebound on POSIX (the macOS/Linux
+            # fix from review). On Windows it instead lets a SECOND ACTIVE listener bind
+            # the same port, which would defeat the inter-process port lock — guard it off.
+            if platform.system() != "Windows":
+                lock_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                lock_socket.bind(("127.0.0.1", self.redirect_port))
+                self._debug_print("Port available, proceeding with monitoring authentication")
+            except OSError as e:
+                lock_socket.close()
+                if e.errno == errno.EADDRINUSE:
+                    self._debug_print("Another authentication is in progress, waiting...")
+
+                    self._wait_for_auth_completion()
+                    token = self.get_monitoring_token()
+                    if token:
+                        return token
+                    else:
+                        self._debug_print("Authentication timeout or failed in another process")
+                        return None
+                else:
+                    raise
+
+            # From here we own the port lock; ensure it is always released.
+            try:
+                # Authenticate with OIDC provider (reuse the bound lock socket).
+                self._debug_print(f"Authenticating with {self.provider_config['name']} for monitoring token...")
+                id_token, token_claims = self.authenticate_oidc(lock_socket=lock_socket)
+            finally:
+                try:
+                    lock_socket.close()
+                except Exception:
+                    pass  # nosec B110
+
+            # Persist the monitoring token only. Deliberately NO AWS credential
+            # exchange here: this entrypoint serves OTEL attribution, and
+            # minting credentials on it would bypass quota enforcement (#761) —
+            # every credential-minting path must enforce quota first. A blocked
+            # user still gets a monitoring token so their telemetry stays
+            # attributed.
+            self.save_monitoring_token(id_token, token_claims)
+
+            # Return just the monitoring token
+            return id_token
+
+        except KeyboardInterrupt:
+            # User cancelled
+            self._debug_print("Authentication cancelled by user")
+            return None
+        except Exception as e:
+            self._debug_print(f"Error during monitoring authentication: {e}")
+            return None
+
+    # ===========================================
+    # Quota Check Methods (Phase 2)
+    # ===========================================
+
+    def _should_check_quota(self) -> bool:
+        """Check if quota checking is configured and enabled."""
+        quota_api_endpoint = self.config.get("quota_api_endpoint")
+        return bool(quota_api_endpoint)
+
+    def _should_recheck_quota(self) -> bool:
+        """Check if quota should be re-verified based on configured interval.
+
+        Returns True if:
+        - Quota checking is enabled AND
+        - Either interval is 0 (always check) OR
+        - Last quota check was more than interval minutes ago
+        """
+        if not self._should_check_quota():
+            return False
+
+        interval_minutes = self.config.get("quota_check_interval", 30)
+        if interval_minutes == 0:
+            return True  # Always check
+
+        last_check = self._get_last_quota_check_time()
+        if not last_check:
+            return True  # Never checked
+
+        elapsed = (datetime.now(timezone.utc) - last_check).total_seconds() / 60
+        self._debug_print(f"Quota check: {elapsed:.1f} min since last check, interval={interval_minutes} min")
+        return elapsed >= interval_minutes
+
+    def _get_last_quota_check_time(self) -> datetime | None:
+        """Get timestamp of last quota check from storage."""
+        try:
+            if self.credential_storage == "keyring":
+                timestamp_str = keyring.get_password("governed-inference-platform", f"{self.profile}-quota-check")
+                if timestamp_str:
+                    return datetime.fromisoformat(timestamp_str)
+            else:
+                session_dir = Path.home() / ".gip-session"
+                timestamp_file = session_dir / f"{self.profile}-quota-check.json"
+                if timestamp_file.exists():
+                    with open(timestamp_file, encoding="utf-8") as f:
+                        data = json.load(f)
+                        return datetime.fromisoformat(data["last_check"])
+            return None
+        except Exception as e:
+            self._debug_print(f"Could not read quota check timestamp: {e}")
+            return None
+
+    def _save_quota_check_timestamp(self):
+        """Save current time as last quota check timestamp."""
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            if self.credential_storage == "keyring":
+                keyring.set_password("governed-inference-platform", f"{self.profile}-quota-check", now)
+            else:
+                session_dir = Path.home() / ".gip-session"
+                session_dir.mkdir(parents=True, exist_ok=True)
+                timestamp_file = session_dir / f"{self.profile}-quota-check.json"
+                with open(timestamp_file, "w", encoding="utf-8") as f:
+                    json.dump({"last_check": now}, f)
+                timestamp_file.chmod(0o600)
+            self._debug_print("Saved quota check timestamp")
+        except Exception as e:
+            self._debug_print(f"Could not save quota check timestamp: {e}")
+
+    def _get_cached_token_claims(self) -> dict | None:
+        """Get token claims from cached monitoring token for quota re-check."""
+        try:
+            if self.credential_storage == "keyring":
+                if platform.system() == "Windows":
+                    # Email lives in the meta entry; no need to reassemble chunks.
+                    meta_json = keyring.get_password("governed-inference-platform", f"{self.profile}-monitoring-meta")
+                    if meta_json:
+                        return {"email": json.loads(meta_json).get("email", "")}
+                    # Legacy single-entry fallback
+                    token_json = keyring.get_password("governed-inference-platform", f"{self.profile}-monitoring")
+                    if token_json:
+                        return {"email": json.loads(token_json).get("email", "")}
+                else:
+                    token_json = keyring.get_password("governed-inference-platform", f"{self.profile}-monitoring")
+                    if token_json:
+                        token_data = json.loads(token_json)
+                        return {"email": token_data.get("email", "")}
+            else:
+                session_dir = Path.home() / ".gip-session"
+                token_file = session_dir / f"{self.profile}-monitoring.json"
+                if token_file.exists():
+                    with open(token_file, encoding="utf-8") as f:
+                        token_data = json.load(f)
+                        return {"email": token_data.get("email", "")}
+            return None
+        except Exception:
+            return None
+
+    def _extract_groups(self, token_claims: dict) -> list:
+        """Extract group memberships from JWT token claims.
+
+        Looks for groups in multiple claim formats:
+        - groups: Standard groups claim
+        - cognito:groups: Amazon Cognito groups
+        - custom:department: Custom department claim (treated as a group)
+        """
+        groups = []
+
+        # Standard groups claim
+        if "groups" in token_claims:
+            claim_groups = token_claims["groups"]
+            if isinstance(claim_groups, list):
+                groups.extend(claim_groups)
+            elif isinstance(claim_groups, str):
+                groups.append(claim_groups)
+
+        # Cognito groups
+        if "cognito:groups" in token_claims:
+            claim_groups = token_claims["cognito:groups"]
+            if isinstance(claim_groups, list):
+                groups.extend(claim_groups)
+            elif isinstance(claim_groups, str):
+                groups.append(claim_groups)
+
+        # Custom department (treated as a group for policy matching)
+        if "custom:department" in token_claims:
+            department = token_claims["custom:department"]
+            if department:
+                groups.append(f"department:{department}")
+
+        return list(set(groups))  # Remove duplicates
+
+    def _check_quota(self, token_claims: dict, id_token: str = None, frozen_credentials=None) -> dict:
+        """Check user quota via the quota check API.
+
+        Supports two auth modes:
+        - OIDC: sends JWT in Authorization header (API Gateway JWT Authorizer)
+        - IDC/IAM: sends SigV4-signed request (API Gateway IAM auth)
+
+        Args:
+            token_claims: JWT token claims containing user info (for logging/fallback).
+                          For IDC, may be empty — email is resolved from IAM ARN server-side.
+            id_token: Raw JWT token for OIDC path. None for IDC path.
+            frozen_credentials: Pre-resolved boto credentials for SigV4 signing.
+                               When provided, used directly instead of resolving from
+                               ambient chain. Fixes 403 when ambient creds differ from
+                               the profile's SSO credentials.
+
+        Returns:
+            Quota check result dict with 'allowed' key
+        """
+        quota_api_endpoint = self.config.get("quota_api_endpoint")
+        fail_mode = self.config.get("quota_fail_mode", "closed")
+        timeout = self.config.get("quota_check_timeout", 5)
+
+        email = token_claims.get("email") if token_claims else None
+        if not email and not id_token:
+            # IDC path: email will be resolved server-side from IAM ARN
+            self._debug_print("IDC mode: email will be resolved from IAM ARN by quota Lambda")
+        elif not email:
+            self._debug_print("No email in token claims")
+            if fail_mode == "open":
+                return {"allowed": True, "reason": "no_email"}
+            return {
+                "allowed": False,
+                "reason": "missing_identity",
+                "message": "Quota check requires an email claim. Contact your administrator to fix IdP claim mapping.",
+            }
+
+        if email:
+            groups = self._extract_groups(token_claims)
+            self._debug_print(f"Checking quota for {email} (groups: {groups})")
+        else:
+            self._debug_print("Checking quota via IAM identity")
+
+        try:
+            if id_token:
+                # OIDC path: JWT in Authorization header
+                response = requests.get(
+                    f"{quota_api_endpoint}/check", headers={"Authorization": f"Bearer {id_token}"}, timeout=timeout
+                )
+            else:
+                # IDC/IAM path: SigV4-signed request using resolved credentials
+                import botocore.session
+                from botocore.auth import SigV4Auth
+                from botocore.awsrequest import AWSRequest
+                from botocore.credentials import Credentials
+
+                if frozen_credentials:
+                    # Use pre-resolved credentials (from passthrough/IDC path).
+                    # frozen_credentials is a ReadOnlyCredentials namedtuple;
+                    # wrap into botocore Credentials for SigV4Auth.
+                    credentials = Credentials(
+                        access_key=frozen_credentials.access_key,
+                        secret_key=frozen_credentials.secret_key,
+                        token=frozen_credentials.token,
+                    )
+                else:
+                    # Fallback: resolve from ambient chain (may differ from profile)
+                    session = botocore.session.get_session()
+                    credentials = session.get_credentials().get_frozen_credentials()
+                url = f"{quota_api_endpoint}/check"
+                request = AWSRequest(method="GET", url=url)
+                SigV4Auth(credentials, "execute-api", self.config.get("aws_region", "us-east-1")).add_auth(request)
+                response = requests.get(url, headers=dict(request.headers), timeout=timeout)
+
+            if response.status_code == 200:
+                result = response.json()
+                self._debug_print(f"Quota check result: allowed={result.get('allowed')}, reason={result.get('reason')}")
+                return result
+            elif response.status_code == 401:
+                # JWT validation failed at API Gateway
+                self._debug_print("Quota check JWT validation failed (401)")
+                if fail_mode != "open":
+                    return {
+                        "allowed": False,
+                        "reason": "jwt_invalid",
+                        "message": "Quota check authentication failed - invalid or expired token",
+                    }
+                return {"allowed": True, "reason": "jwt_invalid"}
+            else:
+                self._debug_print(f"Quota check returned status {response.status_code}")
+                # Fail according to configured mode
+                if fail_mode != "open":
+                    return {
+                        "allowed": False,
+                        "reason": "api_error",
+                        "message": f"Quota check failed with status {response.status_code}",
+                    }
+                return {"allowed": True, "reason": "api_error"}
+
+        except requests.exceptions.Timeout:
+            self._debug_print("Quota check timed out")
+            if fail_mode != "open":
+                return {"allowed": False, "reason": "timeout", "message": "Quota check timed out. Please try again."}
+            return {"allowed": True, "reason": "timeout"}
+
+        except requests.exceptions.RequestException as e:
+            self._debug_print(f"Quota check request failed: {e}")
+            if fail_mode != "open":
+                return {
+                    "allowed": False,
+                    "reason": "connection_error",
+                    "message": f"Could not connect to quota service: {e}",
+                }
+            return {"allowed": True, "reason": "connection_error"}
+
+        except Exception as e:
+            self._debug_print(f"Quota check error: {e}")
+            if fail_mode != "open":
+                return {"allowed": False, "reason": "error", "message": f"Quota check failed: {e}"}
+            return {"allowed": True, "reason": "error"}
+
+    def _handle_quota_blocked(self, quota_result: dict) -> int:
+        """Handle blocked quota by displaying user-friendly message.
+
+        Args:
+            quota_result: Result from quota check API
+
+        Returns:
+            Exit code (always 1 for blocked)
+        """
+        reason = quota_result.get("reason", "unknown")
+        message = quota_result.get("message", "Access blocked due to quota limits")
+        usage = quota_result.get("usage", {})
+        policy = quota_result.get("policy", {})
+
+        print("\n" + "=" * 60, file=sys.stderr)
+        print("ACCESS BLOCKED - QUOTA EXCEEDED", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+
+        print(f"\n{message}\n", file=sys.stderr)
+
+        if usage:
+            print("Current Usage:", file=sys.stderr)
+            if "monthly_tokens" in usage and "monthly_limit" in usage:
+                print(
+                    f"  Monthly: {usage['monthly_tokens']:,} / {usage['monthly_limit']:,} tokens ({usage.get('monthly_percent', 0):.1f}%)",
+                    file=sys.stderr,
+                )
+            if "daily_tokens" in usage and "daily_limit" in usage:
+                print(
+                    f"  Daily: {usage['daily_tokens']:,} / {usage['daily_limit']:,} tokens ({usage.get('daily_percent', 0):.1f}%)",
+                    file=sys.stderr,
+                )
+
+        if policy:
+            print(f"\nPolicy: {policy.get('type', 'unknown')}:{policy.get('identifier', 'unknown')}", file=sys.stderr)
+
+        print("\nTo request an unblock, contact your administrator.", file=sys.stderr)
+        print("=" * 60 + "\n", file=sys.stderr)
+
+        # Show browser notification
+        self._show_quota_browser_notification(quota_result, is_blocked=True)
+
+        # Clear cached STS credentials so next call goes through refresh path
+        # which always re-checks quota (no interval bypass)
+        self._clear_sts_credentials()
+
+        return 1
+
+    def _show_quota_browser_notification(self, quota_result: dict, is_blocked: bool = False):
+        """Show quota status in browser with visual progress bars.
+
+        Args:
+            quota_result: Result from quota check API
+            is_blocked: Whether access is blocked (vs warning)
+        """
+        try:
+            usage = quota_result.get("usage", {})
+            message = quota_result.get("message", "")
+
+            # Calculate percentages
+            monthly_percent = usage.get("monthly_percent", 0)
+            daily_percent = usage.get("daily_percent", 0)
+
+            # Format numbers for display
+            monthly_tokens = usage.get("monthly_tokens", 0)
+            monthly_limit = usage.get("monthly_limit", 0)
+            daily_tokens = usage.get("daily_tokens", 0)
+            daily_limit = usage.get("daily_limit", 0)
+
+            def format_tokens(n):
+                if n >= 1_000_000_000:
+                    return f"{n / 1_000_000_000:.1f}B"
+                elif n >= 1_000_000:
+                    return f"{n / 1_000_000:.1f}M"
+                elif n >= 1_000:
+                    return f"{n / 1_000:.1f}K"
+                return str(int(n))
+
+            # Determine status styling
+            if is_blocked:
+                status_emoji = "🚫"
+                status_text = "Access Blocked"
+                status_color = "#dc3545"
+                header_bg = "#f8d7da"
+            else:
+                status_emoji = "⚠️"
+                status_text = "Quota Warning"
+                status_color = "#ffc107"
+                header_bg = "#fff3cd"
+
+            # Progress bar color based on percentage
+            def bar_color(pct):
+                if pct >= 100:
+                    return "#dc3545"  # Red
+                elif pct >= 90:
+                    return "#fd7e14"  # Orange
+                elif pct >= 80:
+                    return "#ffc107"  # Yellow
+                return "#28a745"  # Green
+
+            monthly_bar_color = bar_color(monthly_percent)
+            daily_bar_color = bar_color(daily_percent) if daily_limit else "#6c757d"
+
+            html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>Quota Status - Governed Inference Platform</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            margin: 0;
+            padding: 40px;
+            background: #f5f5f5;
+            min-height: 100vh;
+            box-sizing: border-box;
+        }}
+        .container {{
+            max-width: 500px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }}
+        .header {{
+            background: {header_bg};
+            padding: 30px;
+            text-align: center;
+            border-bottom: 1px solid rgba(0,0,0,0.1);
+        }}
+        .header h1 {{
+            margin: 0;
+            color: {status_color};
+            font-size: 28px;
+        }}
+        .content {{
+            padding: 30px;
+        }}
+        .usage-section {{
+            margin-bottom: 25px;
+        }}
+        .usage-label {{
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-size: 14px;
+            color: #666;
+        }}
+        .usage-value {{
+            font-weight: 600;
+            color: #333;
+        }}
+        .progress-bar {{
+            height: 24px;
+            background: #e9ecef;
+            border-radius: 12px;
+            overflow: hidden;
+        }}
+        .progress-fill {{
+            height: 100%;
+            border-radius: 12px;
+            transition: width 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            padding-right: 10px;
+            font-size: 12px;
+            font-weight: 600;
+            color: white;
+            box-sizing: border-box;
+        }}
+        .message {{
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+            font-size: 14px;
+            color: #666;
+            line-height: 1.5;
+            margin-bottom: 20px;
+        }}
+        .footer {{
+            text-align: center;
+            padding: 20px;
+            background: #f8f9fa;
+            font-size: 13px;
+            color: #666;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>{status_emoji} {status_text}</h1>
+        </div>
+        <div class="content">
+            <div class="usage-section">
+                <div class="usage-label">
+                    <span>Monthly Usage</span>
+                    <span class="usage-value">{format_tokens(monthly_tokens)} / {format_tokens(monthly_limit)} ({
+                monthly_percent:.1f}%)</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: {min(monthly_percent, 100)}%; background: {
+                monthly_bar_color
+            };">
+                        {monthly_percent:.0f}%
+                    </div>
+                </div>
+            </div>
+            {
+                ""
+                if not daily_limit
+                else f'''
+            <div class="usage-section">
+                <div class="usage-label">
+                    <span>Daily Usage</span>
+                    <span class="usage-value">{format_tokens(daily_tokens)} / {format_tokens(daily_limit)} ({daily_percent:.1f}%)</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: {min(daily_percent, 100)}%; background: {daily_bar_color};">
+                        {daily_percent:.0f}%
+                    </div>
+                </div>
+            </div>
+            '''
+            }
+            <div class="message">
+                {
+                html_module.escape(message)
+                if message
+                else (
+                    "Your access has been blocked due to quota limits."
+                    if is_blocked
+                    else "You're approaching your quota limit."
+                )
+            }
+                {" Contact your administrator for assistance." if is_blocked else ""}
+            </div>
+        </div>
+        <div class="footer">
+            Return to your terminal to continue.
+        </div>
+    </div>
+</body>
+</html>"""
+
+            # Start a brief HTTP server to serve the page
+            parent = self
+            page_served = {"done": False}
+
+            class QuotaPageHandler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(200)
+                    self.send_header("Content-type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(html.encode())
+                    page_served["done"] = True
+
+                def log_message(self, format, *args):
+                    pass  # Suppress logs
+
+            # Use a different port for quota page (8401) to avoid conflict with auth
+            quota_port = self.redirect_port + 1
+            try:
+                server = HTTPServer(("127.0.0.1", quota_port), QuotaPageHandler)
+                server.timeout = 5  # 5 second timeout
+
+                # Open browser
+                webbrowser.open(f"http://localhost:{quota_port}/quota-status")
+
+                # Wait for page to be served (or timeout)
+                while not page_served["done"]:
+                    server.handle_request()
+
+                server.server_close()
+            except OSError:
+                # Port in use or other error - skip browser notification
+                self._debug_print(f"Could not start quota notification server on port {quota_port}")
+
+        except Exception as e:
+            self._debug_print(f"Failed to show browser notification: {e}")
+
+    def _handle_quota_warning(self, quota_result: dict):
+        """Handle quota warning by showing notification without blocking.
+
+        Args:
+            quota_result: Result from quota check API
+        """
+        usage = quota_result.get("usage") or {}
+        monthly_percent = usage.get("monthly_percent", 0)
+        daily_percent = usage.get("daily_percent", 0)
+
+        # Only show warning for significant thresholds (80%+)
+        if monthly_percent < 80 and daily_percent < 80:
+            return
+
+        # Show terminal warning
+        print("\n" + "=" * 60, file=sys.stderr)
+        print("QUOTA WARNING", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+
+        if usage:
+            if "monthly_tokens" in usage and "monthly_limit" in usage:
+                print(
+                    f"  Monthly: {usage['monthly_tokens']:,} / {usage['monthly_limit']:,} tokens ({monthly_percent:.1f}%)",
+                    file=sys.stderr,
+                )
+            if "daily_tokens" in usage and "daily_limit" in usage:
+                print(
+                    f"  Daily: {usage['daily_tokens']:,} / {usage['daily_limit']:,} tokens ({daily_percent:.1f}%)",
+                    file=sys.stderr,
+                )
+
+        print("=" * 60 + "\n", file=sys.stderr)
+
+        # Show browser notification
+        self._show_quota_browser_notification(quota_result, is_blocked=False)
+
+    # ===========================================
+    # End Quota Check Methods
+    # ===========================================
+
+    def _get_cached_token_for_silent_refresh(self):
+        """Return (id_token, token_claims) from the cached monitoring token, or (None, None).
+
+        Read-only: no STS exchange happens here so the caller can enforce
+        quota with the token BEFORE any credentials are minted.
+        """
+        try:
+            id_token = self.get_monitoring_token()
+            if not id_token:
+                self._debug_print("No valid cached id_token for silent refresh")
+                return None, None
+            # Signature verification is intentionally skipped: this is the
+            # locally cached token (user-owned cache file / env var), decoded
+            # only to extract display/session-name claims. The token itself is
+            # verified server-side by both the quota API and STS
+            # AssumeRoleWithWebIdentity (against the issuer JWKS) before any
+            # credentials are minted; a tampered cache cannot mint credentials.
+            token_claims = jwt.decode(id_token, **_CLAIMS_ONLY_DECODE_KWARGS)
+            return id_token, token_claims
+        except Exception as e:
+            self._debug_print(f"Could not load cached id_token for silent refresh: {e}")
+            return None, None
+
+    def _try_silent_refresh(self, id_token, token_claims):
+        """Exchange a quota-cleared cached id_token for AWS credentials and persist them.
+
+        Callers MUST run the quota check first — this method mints and caches
+        credentials, so calling it before quota clearance would hand an
+        over-quota user a full STS session.
+
+        Returns:
+            Credentials dict if successful, None otherwise (caller falls back to browser auth).
+        """
+        try:
+            self._debug_print("Found valid cached id_token, attempting silent credential refresh...")
+            credentials = self.get_aws_credentials(id_token, token_claims)
+            self.save_credentials(credentials)
+            self.save_monitoring_token(id_token, token_claims)
+            self._debug_print("Silent credential refresh succeeded")
+            return credentials
+        except Exception as e:
+            self._debug_print(f"Silent refresh failed, will require browser auth: {e}")
+            return None
+
+    def _run_passthrough(self):
+        """Emit credentials from the ambient AWS credential chain (Identity Center, env vars, instance profile).
+
+        Used when sso_enabled=false — no OIDC browser flow, just surface whatever
+        credentials boto3 already has resolved for the caller.
+
+        Note: Expiration is omitted because we cannot reliably determine the
+        actual expiry of ambient credentials. The AWS SDK will cache these
+        until they fail, at which point the user must re-authenticate
+        (e.g. 'aws sso login'). This matches the credential-process spec:
+        omitting Expiration means "credentials do not expire."
+        """
+        session = boto3.Session()
+        creds = session.get_credentials()
+        if creds is None:
+            print(
+                "Error: sso_enabled=false but no ambient AWS credentials found. Log in via 'aws sso login' first.",
+                file=sys.stderr,
+            )
+            return 1
+
+        frozen = creds.get_frozen_credentials()
+        if not frozen.access_key:
+            print(
+                "Error: ambient credentials resolved but access key is empty. "
+                "Check your AWS CLI configuration or run 'aws sso login'.",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Quota enforcement (SigV4-signed — email resolved from IAM ARN server-side).
+        if self._should_check_quota():
+            self._debug_print("IDC/passthrough: performing SigV4 quota check")
+            quota_result = self._check_quota(token_claims={}, id_token=None, frozen_credentials=frozen)
+            if not quota_result.get("allowed", True):
+                reason = quota_result.get("reason", "quota exceeded")
+                message = quota_result.get("message", "Usage quota exceeded. Contact your administrator.")
+                print(f"Error: {message}", file=sys.stderr)
+                print(f"Reason: {reason}", file=sys.stderr)
+                return 1
+            self._save_quota_check_timestamp()
+
+        output = {
+            "Version": 1,
+            "AccessKeyId": frozen.access_key,
+            "SecretAccessKey": frozen.secret_key,
+        }
+        if frozen.token:
+            output["SessionToken"] = frozen.token
+
+        print(json.dumps(output))
+        return 0
+
+    def run(self):
+        """Main execution flow"""
+        if not getattr(self, "sso_enabled", True):
+            return self._run_passthrough()
+
+        try:
+            # Check cache first
+            cached = self.get_cached_credentials()
+            if cached:
+                # Periodic quota re-check even with cached credentials
+                if self._should_recheck_quota():
+                    self._debug_print("Performing periodic quota re-check...")
+                    id_token = self.get_monitoring_token()
+                    token_claims = self._get_cached_token_claims()
+                    if id_token and token_claims:
+                        # OIDC path: check with JWT
+                        quota_result = self._check_quota(token_claims, id_token)
+                        self._save_quota_check_timestamp()
+                        if not quota_result.get("allowed", True):
+                            return self._handle_quota_blocked(quota_result)
+                        else:
+                            self._handle_quota_warning(quota_result)
+                    else:
+                        # IDC/IAM path: check with SigV4 (no JWT needed)
+                        self._debug_print("No JWT token — using IAM identity for quota check")
+                        quota_result = self._check_quota({}, None)
+                        self._save_quota_check_timestamp()
+                        if not quota_result.get("allowed", True):
+                            return self._handle_quota_blocked(quota_result)
+                        else:
+                            self._handle_quota_warning(quota_result)
+
+                # Output cached credentials (intended behavior for AWS CLI)
+                print(json.dumps(cached))  # noqa: S105
+                return 0
+
+            # Try to acquire port lock by testing if we can bind to it.
+            # Keep the socket BOUND (don't close it) so the port is held
+            # continuously through authenticate_oidc — closing it here would open
+            # a TOCTOU window for a concurrent credential-process to also auth.
+            lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # SO_REUSEADDR lets a TIME_WAIT socket be rebound on POSIX (the macOS/Linux
+            # fix from review). On Windows it instead lets a SECOND ACTIVE listener bind
+            # the same port, which would defeat the inter-process port lock — guard it off.
+            if platform.system() != "Windows":
+                lock_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                lock_socket.bind(("127.0.0.1", self.redirect_port))
+                self._debug_print("Port available, proceeding with authentication")
+            except OSError as e:
+                lock_socket.close()
+                if e.errno == errno.EADDRINUSE:
+                    self._debug_print("Another authentication is in progress, waiting...")
+
+                    cached = self._wait_for_auth_completion()
+                    if cached:
+                        print(json.dumps(cached))
+                        return 0
+                    else:
+                        self._debug_print("Authentication timeout or failed in another process")
+                        return 1
+                else:
+                    raise
+
+            # From here we own the port lock; ensure it is always released.
+            try:
+                # Check cache again (another process might have just finished)
+                cached = self.get_cached_credentials()
+                if cached:
+                    print(json.dumps(cached))  # noqa: S105
+                    return 0
+
+                # Try silent refresh using cached id_token before opening browser.
+                # Quota is enforced BEFORE the STS exchange, using the id_token
+                # already in hand, so an over-quota user never mints or caches
+                # fresh credentials on this path (#761).
+                id_token, token_claims = self._get_cached_token_for_silent_refresh()
+                if id_token:
+                    if self._should_check_quota():
+                        quota_result = self._check_quota(token_claims, id_token)
+                        self._save_quota_check_timestamp()
+                        if not quota_result.get("allowed", True):
+                            return self._handle_quota_blocked(quota_result)
+                        self._handle_quota_warning(quota_result)
+
+                    silent_creds = self._try_silent_refresh(id_token, token_claims)
+                    if silent_creds:
+                        print(json.dumps(silent_creds))
+                        return 0
+
+                # Authenticate with OIDC provider (browser popup - only when id_token is also expired).
+                # Hand the still-bound lock socket to the OAuth callback server so
+                # the port is never released between the lock check and the callback.
+                self._debug_print(f"Authenticating with {self.provider_config['name']} for profile '{self.profile}'...")
+                id_token, token_claims = self.authenticate_oidc(lock_socket=lock_socket)
+            finally:
+                try:
+                    lock_socket.close()
+                except Exception:
+                    pass  # nosec B110
+
+            # Check quota before issuing credentials (if configured)
+            if self._should_check_quota():
+                self._debug_print("Checking quota before credential issuance...")
+                quota_result = self._check_quota(token_claims, id_token)
+                self._save_quota_check_timestamp()  # Track when quota was checked
+                if not quota_result.get("allowed", True):
+                    return self._handle_quota_blocked(quota_result)
+                else:
+                    # Check for warning threshold (allowed but high usage)
+                    self._handle_quota_warning(quota_result)
+
+            # Get AWS credentials
+            self._debug_print("Exchanging token for AWS credentials...")
+            credentials = self.get_aws_credentials(id_token, token_claims)
+
+            # Cache credentials
+            self.save_credentials(credentials)
+
+            # Save monitoring token (non-blocking, failures don't affect AWS auth)
+            self.save_monitoring_token(id_token, token_claims)
+
+            # Output credentials
+            # CodeQL: This is not a security issue - this is an AWS credential provider
+            # that must output credentials to stdout for AWS CLI to consume them.
+            # This is the intended behavior and required for the tool to function.
+            # nosec - Not logging, but outputting credentials as designed
+            print(json.dumps(credentials))  # noqa: S105
+            return 0
+
+        except KeyboardInterrupt:
+            # User cancelled - no output needed
+            return 1
+        except Exception as e:
+            import traceback
+
+            error_msg = str(e)
+            # Only print actual errors to stderr
+            if "timeout" not in error_msg.lower():
+                print(f"Error: {error_msg}", file=sys.stderr)
+                if self.debug:
+                    traceback.print_exc(file=sys.stderr)
+            else:
+                self._debug_print(f"Error: {error_msg}")
+                if self.debug:
+                    traceback.print_exc(file=sys.stderr)
+
+            # Provide specific guidance for common errors
+            if "NotAuthorizedException" in error_msg and "Token is not from a supported provider" in error_msg:
+                print("\nAuthentication failed: Token provider mismatch", file=sys.stderr)
+                print("Identity pool expects tokens from a specific provider configuration.", file=sys.stderr)
+                print("Please verify your Cognito Identity Pool is configured correctly.", file=sys.stderr)
+            elif "timeout" in error_msg.lower():
+                self._debug_print("\nAuthentication timed out. Possible causes:")
+                self._debug_print("- Browser did not complete authentication")
+                self._debug_print("- Network connectivity issues")
+                self._debug_print(f"- Callback URL was not accessible on localhost:{self.redirect_port}")
+            elif "cognito_user_pool_id is required" in error_msg:
+                print("\nConfiguration error: Missing Cognito User Pool ID", file=sys.stderr)
+                print("Please run 'poetry run gip init' to reconfigure.", file=sys.stderr)
+
+            return 1
+
+
+def main():
+    """CLI entry point"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="AWS credential provider for OIDC + Cognito Identity Pool")
+    # Check environment variable first, then use default
+    default_profile = os.getenv("GIP_PROFILE", "gip")
+    parser.add_argument("--profile", "-p", default=default_profile, help="Configuration profile to use")
+    parser.add_argument("--version", "-v", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument(
+        "--get-monitoring-token", action="store_true", help="Get cached monitoring token instead of AWS credentials"
+    )
+    parser.add_argument(
+        "--get-mcp-auth-header",
+        action="store_true",
+        help=(
+            'Print {"Authorization":"Bearer <id_token>"} from the cached token for an MCP '
+            "headersHelper (never opens a browser)"
+        ),
+    )
+    parser.add_argument(
+        "--clear-cache", action="store_true", help="Clear cached credentials and force re-authentication"
+    )
+    parser.add_argument(
+        "--check-expiration",
+        action="store_true",
+        help="Check if credentials need refresh (exit 0 if valid, 1 if expired)",
+    )
+    parser.add_argument(
+        "--refresh-if-needed",
+        action="store_true",
+        help="Refresh credentials if expired (for cron jobs with session storage)",
+    )
+    parser.add_argument(
+        "--set-client-secret",
+        action="store_true",
+        default=False,
+        help=(
+            "Store Azure AD client secret in OS secure storage. "
+            "For non-interactive use set GIP_CLIENT_SECRET env var before running; "
+            "otherwise an interactive prompt is shown. Blank input clears the stored secret."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    # Handle --set-client-secret before loading full auth config.
+    # Secrets must never be passed as CLI arguments — they appear in shell history
+    # and process listings.  Use GIP_CLIENT_SECRET env var for automation, or
+    # the interactive getpass prompt for manual setup.
+    if args.set_client_secret:
+        import getpass
+
+        env_secret = os.environ.get("GIP_CLIENT_SECRET")
+        if env_secret is not None:
+            if not env_secret:
+                print("Error: GIP_CLIENT_SECRET is set but empty.", file=sys.stderr)
+                sys.exit(1)
+            secret = env_secret
+        else:
+            secret = getpass.getpass(f"Enter client secret for profile '{args.profile}' (press Enter to clear): ")
+
+        try:
+            if not secret:
+                try:
+                    keyring.delete_password("governed-inference-platform", f"{args.profile}-client-secret")
+                except keyring.errors.PasswordDeleteError:
+                    pass  # Secret already absent, nothing to clear
+                print(f"✓ Client secret cleared for profile '{args.profile}'", file=sys.stderr)
+            else:
+                keyring.set_password("governed-inference-platform", f"{args.profile}-client-secret", secret)
+                print(f"✓ Client secret stored in OS secure storage for profile '{args.profile}'", file=sys.stderr)
+        except Exception as e:
+            print(f"Error managing client secret in keyring: {e}", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
+
+    auth = MultiProviderAuth(profile=args.profile)
+
+    # Handle cache clearing request
+    if args.clear_cache:
+        cleared = auth.clear_cached_credentials()
+        if cleared:
+            print(f"Cleared cached credentials for profile '{args.profile}':", file=sys.stderr)
+            for item in cleared:
+                print(f"  • {item}", file=sys.stderr)
+        else:
+            print(f"No cached credentials found for profile '{args.profile}'", file=sys.stderr)
+        sys.exit(0)
+
+    # Handle monitoring token request
+    if args.get_monitoring_token:
+        token = auth.get_monitoring_token()
+        if token:
+            print(token)
+            sys.exit(0)
+        else:
+            # No cached token, trigger authentication to get one
+            auth._debug_print("No valid monitoring token found, triggering authentication...")
+            # Use the new monitoring-specific authentication method
+            token = auth.authenticate_for_monitoring()
+            if token:
+                print(token)
+                sys.exit(0)
+            else:
+                # Authentication failed or was cancelled
+                # Return failure exit code so OTEL helper knows auth failed
+                # This prevents OTEL helper from using default/unknown values
+                sys.exit(1)
+
+    # Handle MCP auth-header request.
+    # Used as the headersHelper for the AgentCore web-search MCP server, whose
+    # gateway runs a CUSTOM_JWT authorizer validating the same OIDC id_token the
+    # solution already mints. MUST be fast and MUST NOT open a browser — an MCP
+    # headersHelper can never drive an interactive login. So, unlike
+    # --get-monitoring-token, this never falls through to authentication: on a
+    # cache miss it fails cleanly with a non-zero exit.
+    if args.get_mcp_auth_header:
+        header = auth.get_mcp_auth_header()
+        if header:
+            # Compact separators so Go (encoding/json) and Python emit byte-identical output.
+            print(json.dumps(header, separators=(",", ":")))
+            sys.exit(0)
+        else:
+            print(
+                f"Error: no valid cached token for profile '{args.profile}'; "
+                "run the credential process once to authenticate.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    # Handle check-expiration request
+    if args.check_expiration:
+        is_expired = auth.check_credentials_file_expiration(args.profile)
+        if is_expired:
+            print(f"Credentials expired or missing for profile '{args.profile}'", file=sys.stderr)
+            sys.exit(1)
+        else:
+            print(f"Credentials valid for profile '{args.profile}'", file=sys.stderr)
+            sys.exit(0)
+
+    # Handle refresh-if-needed request (for cron jobs with session storage)
+    if args.refresh_if_needed:
+        # Only works with session storage mode (credentials file)
+        if auth.credential_storage != "session":
+            print("Error: --refresh-if-needed only works with session storage mode", file=sys.stderr)
+            sys.exit(1)
+
+        is_expired = auth.check_credentials_file_expiration(args.profile)
+        if not is_expired:
+            # Credentials still valid, nothing to do
+            auth._debug_print(f"Credentials still valid for profile '{args.profile}', no refresh needed")
+            sys.exit(0)
+        # Credentials expired, fall through to normal auth flow
+
+    # Normal AWS credential flow (credential_process mode)
+    # For session storage, this automatically uses ~/.aws/credentials
+    sys.exit(auth.run())
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        import traceback
+
+        print(f"Error: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)

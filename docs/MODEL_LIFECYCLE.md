@@ -1,0 +1,1 @@
+../assets/docs/MODEL_LIFECYCLE.md

@@ -1,0 +1,19 @@
+{
+  "profiles": {
+    "gip": {
+      "provider_domain": "login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0",
+      "client_id": "00000000-0000-0000-0000-000000000000",
+      "provider_type": "azure",
+      "aws_region": "eu-west-1",
+      "identity_pool_id": "eu-west-1:00000000-0000-0000-0000-000000000000",
+      "role_arn": "arn:aws:iam::444455556666:role/AzureCognitoRole",
+      "federation_type": "cognito",
+      "max_session_duration": 28800,
+      "credential_storage": "session",
+      "azure_auth_mode": "public",
+      "oidc_prompt": "select_account",
+      "redirect_port": 8400,
+      "quota_fail_mode": "closed"
+    }
+  }
+}

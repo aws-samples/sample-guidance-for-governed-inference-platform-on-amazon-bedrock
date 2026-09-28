@@ -1,0 +1,132 @@
+name: Sync Claude Apps Gateway upstream
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-claude-apps-gateway
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      upstream_commit: ${{ steps.pin.outputs.commit }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: beta
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+
+      - name: Propose the upstream pin without executing upstream code
+        run: scripts/sync-claude-apps-gateway.sh
+
+      - name: Record tested upstream commit
+        id: pin
+        run: echo "commit=$(jq -r .commit vendor/aws-samples/anthropic-on-aws/UPSTREAM.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Materialize the proposed pin into the ignored vendor paths and verify it
+        run: scripts/fetch-claude-apps-gateway.sh
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '20'
+
+      - name: Install shell-test dependency
+        run: pip install PyYAML
+
+      - name: Test upstream gateway CDK
+        working-directory: vendor/aws-samples/anthropic-on-aws/claude-apps-gateway/cdk
+        run: |
+          npm ci
+          npm test
+
+      - name: Test upstream bootstrap CDK
+        working-directory: vendor/aws-samples/anthropic-on-aws/claude-apps-gateway-bootstrap/cdk
+        run: |
+          npm ci
+          npm test
+
+      - name: Test upstream bootstrap server
+        working-directory: vendor/aws-samples/anthropic-on-aws/claude-apps-gateway-bootstrap/bootstrap
+        run: |
+          npm ci
+          npm test
+
+      - name: Test upstream shell contracts
+        working-directory: vendor/aws-samples/anthropic-on-aws/claude-apps-gateway
+        run: |
+          ./test/stamp-config.test.sh
+          ./test/setup-helpers.test.sh
+
+      - name: Audit upstream gateway dependencies
+        continue-on-error: true
+        working-directory: vendor/aws-samples/anthropic-on-aws/claude-apps-gateway/cdk
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Audit upstream bootstrap dependencies
+        continue-on-error: true
+        working-directory: vendor/aws-samples/anthropic-on-aws/claude-apps-gateway-bootstrap/bootstrap
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Audit upstream bootstrap CDK dependencies
+        continue-on-error: true
+        working-directory: vendor/aws-samples/anthropic-on-aws/claude-apps-gateway-bootstrap/cdk
+        run: npm audit --omit=dev --audit-level=high
+
+  open-review-pr:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: beta
+          fetch-depth: 0
+
+      - name: Pin only the commit that passed the read-only job
+        env:
+          UPSTREAM_COMMIT: ${{ needs.validate.outputs.upstream_commit }}
+        run: |
+          echo "previous_commit=$(jq -r .commit vendor/aws-samples/anthropic-on-aws/UPSTREAM.json)" >> "$GITHUB_ENV"
+          scripts/sync-claude-apps-gateway.sh --ref "$UPSTREAM_COMMIT"
+          test "$(jq -r .commit vendor/aws-samples/anthropic-on-aws/UPSTREAM.json)" = "$UPSTREAM_COMMIT"
+
+      - name: Open or update review pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_COMMIT: ${{ needs.validate.outputs.upstream_commit }}
+        run: |
+          if [ -z "$(git status --porcelain -- vendor/aws-samples/anthropic-on-aws)" ]; then
+            echo "Already synchronized."
+            exit 0
+          fi
+          branch=automation/sync-claude-apps-gateway
+          title="chore: bump Claude Apps Gateway upstream pin"
+          compare_url="https://github.com/aws-samples/anthropic-on-aws/compare/${previous_commit}...${UPSTREAM_COMMIT}"
+          body="Automated pin bump for aws-samples/anthropic-on-aws: ${previous_commit} -> ${UPSTREAM_COMMIT}. "
+          body="${body}Upstream diff: ${compare_url} . Only UPSTREAM.json (commit, tree ids, git-tree-sha1-v1 format) and the LICENSE copy change; "
+          body="${body}scripts/fetch-claude-apps-gateway.sh materializes the pinned bytes. The exact commit passed upstream tests in a "
+          body="${body}credential-free validation job; review the upstream diff, provenance, audit warnings, and behavior before merging."
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git checkout -B "$branch"
+          git add vendor/aws-samples/anthropic-on-aws/UPSTREAM.json vendor/aws-samples/anthropic-on-aws/LICENSE
+          git commit -m "chore: bump Claude Apps Gateway upstream pin"
+          git push --force-with-lease origin "$branch"
+          if ! gh pr view "$branch" >/dev/null 2>&1; then
+            gh pr create --base beta --head "$branch" --title "$title" --body "$body"
+          fi
+          gh pr edit "$branch" --title "$title" --body "$body"

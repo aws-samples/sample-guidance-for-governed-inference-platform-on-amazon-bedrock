@@ -1,0 +1,222 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Opt-in Amazon Bedrock Guardrails enforcement for Governed Inference Platform on Amazon Bedrock.
+  Creates a guardrail, pins an immutable version, and configures the regional
+  account-level enforced guardrail configuration.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Guardrail"
+        Parameters:
+          - GuardrailName
+          - ContentFilterStrength
+          - PolicyRevision
+      - Label:
+          default: "Enforcement scope"
+        Parameters:
+          - ModelIncludeList
+      - Label:
+          default: "Encryption"
+        Parameters:
+          - KmsKeyArn
+    ParameterLabels:
+      GuardrailName:
+        default: "Guardrail name"
+      ContentFilterStrength:
+        default: "Content filter strength"
+      PolicyRevision:
+        default: "Guardrail policy revision"
+      ModelIncludeList:
+        default: "Model IDs to enforce (empty = all models)"
+      KmsKeyArn:
+        default: "Customer-managed KMS key ARN (optional)"
+
+Parameters:
+  GuardrailName:
+    Type: String
+    Default: gip-guardrail
+    AllowedPattern: '^[0-9A-Za-z-_]{1,50}$'
+    Description: Name for the Bedrock guardrail. Must be unique in this account and region.
+
+  ContentFilterStrength:
+    Type: String
+    Default: MEDIUM
+    AllowedValues: [LOW, MEDIUM, HIGH]
+    Description: Input and output strength for every supported harmful-content category.
+
+  PolicyRevision:
+    Type: String
+    Default: v2
+    AllowedPattern: '^[0-9A-Za-z._-]{1,64}$'
+    Description: >-
+      Immutable policy revision marker. Increment this value whenever any
+      guardrail policy setting changes so CloudFormation replaces the
+      GuardrailVersion and snapshots the updated policy.
+
+  ModelIncludeList:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional comma-separated model IDs to enforce. Empty means enforce this guardrail on
+      every Bedrock model invocation in the account and region.
+
+  KmsKeyArn:
+    Type: String
+    Default: ''
+    Description: Optional customer-managed KMS key ARN for encrypting guardrail configuration.
+
+Conditions:
+  HasModelIncludeList: !Not [!Equals [!Ref ModelIncludeList, '']]
+  HasKmsKey: !Not [!Equals [!Ref KmsKeyArn, '']]
+
+Resources:
+  Guardrail:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: !Ref GuardrailName
+      Description: !Sub 'Governed Inference Platform on Amazon Bedrock enforced guardrail for ${AWS::StackName}'
+      KmsKeyArn: !If [HasKmsKey, !Ref KmsKeyArn, !Ref AWS::NoValue]
+      BlockedInputMessaging: This request was blocked by the organization's Bedrock guardrail policy.
+      BlockedOutputsMessaging: This response was blocked by the organization's Bedrock guardrail policy.
+      ContentPolicyConfig:
+        # F-006/F-016: PROMPT_ATTACK is intentionally omitted. Bedrock supports
+        # it only for input, and live validation showed it blocked agentic use.
+        FiltersConfig:
+          - Type: HATE
+            InputStrength: !Ref ContentFilterStrength
+            OutputStrength: !Ref ContentFilterStrength
+            InputAction: BLOCK
+            OutputAction: BLOCK
+            InputEnabled: true
+            OutputEnabled: true
+          - Type: INSULTS
+            InputStrength: !Ref ContentFilterStrength
+            OutputStrength: !Ref ContentFilterStrength
+            InputAction: BLOCK
+            OutputAction: BLOCK
+            InputEnabled: true
+            OutputEnabled: true
+          - Type: SEXUAL
+            InputStrength: !Ref ContentFilterStrength
+            OutputStrength: !Ref ContentFilterStrength
+            InputAction: BLOCK
+            OutputAction: BLOCK
+            InputEnabled: true
+            OutputEnabled: true
+          - Type: VIOLENCE
+            InputStrength: !Ref ContentFilterStrength
+            OutputStrength: !Ref ContentFilterStrength
+            InputAction: BLOCK
+            OutputAction: BLOCK
+            InputEnabled: true
+            OutputEnabled: true
+          - Type: MISCONDUCT
+            InputStrength: !Ref ContentFilterStrength
+            OutputStrength: !Ref ContentFilterStrength
+            InputAction: BLOCK
+            OutputAction: BLOCK
+            InputEnabled: true
+            OutputEnabled: true
+      Tags:
+        - Key: gip:feature
+          Value: guardrails
+
+  GuardrailVersion:
+    Type: AWS::Bedrock::GuardrailVersion
+    Properties:
+      GuardrailIdentifier: !GetAtt Guardrail.GuardrailArn
+      # F-019: Changing the description replaces this immutable version and
+      # prevents enforcement from remaining pinned to a stale policy snapshot.
+      Description: !Sub 'Immutable version for ${GuardrailName} strength ${ContentFilterStrength} policy ${PolicyRevision}'
+
+  EnforcedGuardrailConfiguration:
+    Type: AWS::Bedrock::EnforcedGuardrailConfiguration
+    Properties:
+      GuardrailIdentifier: !GetAtt GuardrailVersion.GuardrailArn
+      GuardrailVersion: !GetAtt GuardrailVersion.Version
+      ModelEnforcement: !If
+        - HasModelIncludeList
+        - IncludedModels: !Split [',', !Ref ModelIncludeList]
+          ExcludedModels: []
+        - !Ref AWS::NoValue
+      SelectiveContentGuarding:
+        Messages: COMPREHENSIVE
+        # F-016: Do not scan the agentic system prompt as user content.
+        System: SELECTIVE
+
+  GuardrailsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${GuardrailName}-${AWS::Region}-guardrails'
+      DashboardBody: !Sub
+        - |
+          {
+            "widgets": [
+              {
+                "type": "metric",
+                "x": 0,
+                "y": 0,
+                "width": 12,
+                "height": 6,
+                "properties": {
+                  "region": "${AWS::Region}",
+                  "title": "Guardrail invocations and interventions",
+                  "view": "timeSeries",
+                  "stacked": false,
+                  "period": 300,
+                  "stat": "Sum",
+                  "metrics": [
+                    ["AWS/Bedrock/Guardrails", "Invocations", "GuardrailArn", "${GuardrailArn}", "GuardrailVersion", "${GuardrailVersion}"],
+                    [".", "InvocationsIntervened", ".", ".", ".", "."]
+                  ]
+                }
+              },
+              {
+                "type": "metric",
+                "x": 12,
+                "y": 0,
+                "width": 12,
+                "height": 6,
+                "properties": {
+                  "region": "${AWS::Region}",
+                  "title": "Guardrail latency and text units",
+                  "view": "timeSeries",
+                  "period": 300,
+                  "stat": "Average",
+                  "metrics": [
+                    ["AWS/Bedrock/Guardrails", "InvocationLatency", "GuardrailArn", "${GuardrailArn}", "GuardrailVersion", "${GuardrailVersion}"],
+                    [".", "TextUnitCount", ".", ".", ".", ".", {"stat": "Sum", "yAxis": "right"}]
+                  ]
+                }
+              }
+            ]
+          }
+        - GuardrailArn: !GetAtt GuardrailVersion.GuardrailArn
+          GuardrailVersion: !GetAtt GuardrailVersion.Version
+
+Outputs:
+  GuardrailArn:
+    Description: ARN of the enforced Bedrock guardrail.
+    Value: !GetAtt GuardrailVersion.GuardrailArn
+    Export:
+      Name: !Sub '${AWS::StackName}-GuardrailArn'
+
+  GuardrailVersion:
+    Description: Immutable guardrail version used for account-level enforcement.
+    Value: !GetAtt GuardrailVersion.Version
+    Export:
+      Name: !Sub '${AWS::StackName}-GuardrailVersion'
+
+  EnforcedConfigurationId:
+    Description: Account-level enforced guardrail configuration ID.
+    Value: !GetAtt EnforcedGuardrailConfiguration.ConfigId
+    Export:
+      Name: !Sub '${AWS::StackName}-EnforcedConfigurationId'
+
+  DashboardName:
+    Description: CloudWatch dashboard for guardrail metadata-only counters.
+    Value: !Ref GuardrailsDashboard
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardName'

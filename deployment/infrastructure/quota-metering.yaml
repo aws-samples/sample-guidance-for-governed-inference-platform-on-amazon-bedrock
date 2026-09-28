@@ -1,0 +1,525 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Claude Code server-side usage metering from Bedrock model invocation logs (deployed once per allowed Bedrock region; optional, default off)'
+
+# Phase 1 (shadow/reconcile) of assets/docs/designs/server-side-metering-design.md.
+# Per-region trio: Bedrock invocation logging config (metadata-only, via a
+# Lambda-backed custom resource with adopt-or-fail semantics — there is no
+# AWS::Bedrock::* CFN resource for the logging singleton) + CloudWatch log
+# group + subscription filter -> processor Lambda that accrues server_*
+# attributes onto the existing UserQuotaMetrics table in the quota region.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Quota table (from the quota-monitoring stack)"
+        Parameters:
+          - QuotaTableName
+          - QuotaTableRegion
+      - Label:
+          default: "Metering behavior"
+        Parameters:
+          - MeteringMode
+          - AdoptExistingConfig
+      - Label:
+          default: "Operations"
+        Parameters:
+          - LogRetentionDays
+          - ProcessorReservedConcurrency
+          - AlarmTopicArn
+    ParameterLabels:
+      QuotaTableName:
+        default: "Quota DynamoDB table name"
+      QuotaTableRegion:
+        default: "Quota table region"
+      MeteringMode:
+        default: "Metering mode (shadow or max)"
+      AdoptExistingConfig:
+        default: "Adopt existing Bedrock invocation-logging configuration"
+      LogRetentionDays:
+        default: "Invocation log retention (days)"
+      ProcessorReservedConcurrency:
+        default: "Processor Lambda reserved concurrency"
+      AlarmTopicArn:
+        default: "Alarm SNS topic ARN (optional)"
+
+Parameters:
+  QuotaTableName:
+    Type: String
+    Default: 'UserQuotaMetrics'
+    Description: Name of the existing UserQuotaMetrics DynamoDB table (from the quota-monitoring stack)
+
+  QuotaTableRegion:
+    Type: String
+    Default: ''
+    Description: >-
+      Region where the UserQuotaMetrics table lives (the quota-monitoring
+      stack region). The processor performs plain cross-region DynamoDB
+      calls (GetItem + TransactWriteItems). Empty = same region as this stack.
+
+  MeteringMode:
+    Type: String
+    Default: 'shadow'
+    AllowedValues:
+      - 'shadow'
+      - 'max'
+    Description: >-
+      Metering mode. 'shadow' collects server-side figures and reconciles
+      against client telemetry without changing enforcement. 'max' makes
+      quota_check enforce on max(client, server). 'strict' is deferred to
+      Phase 3 (see the design doc prerequisites).
+
+  AdoptExistingConfig:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      The Bedrock invocation logging configuration is a per-account,
+      per-region singleton. If one already exists, this stack fails closed
+      unless AdoptExistingConfig=true, in which case it only attaches a
+      subscription filter to an existing metadata-only CloudWatch log group
+      and touches nothing else. Adoption fails if any content-delivery flag is
+      enabled.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: Retention (days) for the invocation log group — data is consumed within seconds; retention is for replay/audit only
+
+  ProcessorReservedConcurrency:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: Reserved concurrency for the metering processor Lambda (bounds cross-region DynamoDB write pressure)
+
+  AlarmTopicArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional SNS topic ARN (must be in THIS region) for metering alarms.
+      Empty = alarms are created without notification actions. CloudWatch
+      alarm actions cannot target cross-region topics, so regions other than
+      the quota region typically leave this empty.
+
+Conditions:
+  HasQuotaTableRegion: !Not [!Equals [!Ref QuotaTableRegion, '']]
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, '']]
+
+Resources:
+  # ============================================
+  # Bedrock invocation logging (metadata-only)
+  # ============================================
+
+  # Managed log group for invocation log delivery. Created unconditionally;
+  # in adopt mode it stays empty and the subscription filter attaches to the
+  # customer's existing log group instead (resolved by the custom resource).
+  MeteringLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      guard:
+        SuppressedRules:
+          # CloudWatch Logs encrypts at rest by default; KmsKeyId requires a
+          # customer-managed CMK (aws-managed keys unsupported).
+          - CLOUDWATCH_LOG_GROUP_ENCRYPTED
+          # False positive: RetentionInDays is set (!Ref LogRetentionDays) -
+          # the rule cannot resolve parameter refs.
+          - CW_LOGGROUP_RETENTION_PERIOD_CHECK
+    Properties:
+      LogGroupName: '/aws/bedrock/gip-metering'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: gip-metering-invocation-logs
+        # F-005: Keep tag values within the shared service tag character set.
+        - Key: Purpose
+          Value: Bedrock model invocation logs metadata-only for server-side quota metering
+        - Key: gip:service
+          Value: quota-metering
+        - Key: gip:cell
+          Value: !Sub '${AWS::AccountId}:${AWS::Region}'
+
+  # Role Bedrock assumes to deliver invocation logs to CloudWatch Logs.
+  BedrockLoggingRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Single-purpose policy scoped to this role only - converting to a
+          # managed policy adds no security.
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:*'
+      Policies:
+        - PolicyName: BedrockInvocationLogDelivery
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                # LogGroup.Arn already ends in :* (covers log streams)
+                Resource: !GetAtt MeteringLogGroup.Arn
+
+  # IAM role for the logging-config custom resource Lambda.
+  MeteringConfigRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "Bedrock *ModelInvocationLoggingConfiguration APIs are account-level singletons with no resource ARN"
+      guard:
+        SuppressedRules:
+          # Single-purpose policy scoped to this role only - converting to a
+          # managed policy adds no security.
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: MeteringConfigPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:GetModelInvocationLoggingConfiguration
+                  - bedrock:PutModelInvocationLoggingConfiguration
+                  - bedrock:DeleteModelInvocationLoggingConfiguration
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt BedrockLoggingRole.Arn
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': bedrock.amazonaws.com
+
+  # Custom resource handler managing the per-region logging singleton.
+  MeteringConfigFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "CloudFormation custom resource — needs Bedrock control-plane access, no VPC resources touched"
+          - id: W92
+            reason: "Invoked only on stack create/update/delete — reserved concurrency unnecessary"
+      guard:
+        SuppressedRules:
+          # Custom resource: failures surface as stack events/rollback via
+          # cfnresponse - a DLQ has no consumer and adds no recovery path.
+          - LAMBDA_DLQ_CHECK
+    Properties:
+      FunctionName: gip-metering-config
+      Description: Custom resource managing the Bedrock model invocation logging config (metadata-only, adopt-or-fail)
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt MeteringConfigRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Code: ./lambda-functions/metering_config/
+      Tags:
+        - Key: Name
+          Value: gip-metering-config
+        - Key: Purpose
+          Value: Bedrock invocation logging configuration management
+        - Key: gip:service
+          Value: quota-metering
+        - Key: gip:cell
+          Value: !Sub '${AWS::AccountId}:${AWS::Region}'
+
+  MeteringLoggingConfig:
+    Type: Custom::BedrockInvocationLoggingConfig
+    Properties:
+      ServiceToken: !GetAtt MeteringConfigFunction.Arn
+      LogGroupName: !Ref MeteringLogGroup
+      RoleArn: !GetAtt BedrockLoggingRole.Arn
+      AdoptExistingConfig: !Ref AdoptExistingConfig
+
+  # ============================================
+  # Metering processor (subscription filter target)
+  # ============================================
+
+  MeteringProcessorDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days
+      # AWS-managed SQS key: the Lambda service writes with the execution
+      # role, which the aws/sqs key policy already covers for this account.
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Name
+          Value: gip-metering-dlq
+        # F-005: Keep tag values within the shared service tag character set.
+        - Key: Purpose
+          Value: Failed metering processor batches - markers + accrual commit atomically so redrive is idempotent
+        - Key: gip:service
+          Value: quota-metering
+        - Key: gip:cell
+          Value: !Sub '${AWS::AccountId}:${AWS::Region}'
+
+  MeteringProcessorRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Single-purpose policy scoped to this role only - converting to a
+          # managed policy adds no security.
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: MeteringProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Cross-region access to the quota table: GetItem (daily-reset
+              # guard) plus TransactWriteItems (DEDUP# marker Puts + server_*
+              # accrual Update in one transaction). Transactions authorize
+              # against the underlying per-item actions (PutItem/UpdateItem);
+              # there is no separate dynamodb:TransactWriteItems action.
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !Sub
+                  - 'arn:${AWS::Partition}:dynamodb:${TableRegion}:${AWS::AccountId}:table/${QuotaTableName}'
+                  - TableRegion: !If [HasQuotaTableRegion, !Ref QuotaTableRegion, !Ref 'AWS::Region']
+              # Async-invocation dead-letter target
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt MeteringProcessorDLQ.Arn
+
+  MeteringProcessorFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Invoked by CloudWatch Logs subscription; needs cross-region DynamoDB access — VPC adds complexity without security benefit"
+      guard:
+        SuppressedRules:
+          # False positive: ReservedConcurrentExecutions is set
+          # (!Ref ProcessorReservedConcurrency) - the rule cannot resolve
+          # parameter refs.
+          - LAMBDA_CONCURRENCY_CHECK
+    Properties:
+      FunctionName: gip-metering-processor
+      Description: Parses Bedrock invocation logs and accrues per-user server-side usage (server_* attrs) in UserQuotaMetrics
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt MeteringProcessorRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      ReservedConcurrentExecutions: !Ref ProcessorReservedConcurrency
+      DeadLetterConfig:
+        TargetArn: !GetAtt MeteringProcessorDLQ.Arn
+      Environment:
+        Variables:
+          QUOTA_TABLE: !Ref QuotaTableName
+          QUOTA_TABLE_REGION: !If [HasQuotaTableRegion, !Ref QuotaTableRegion, !Ref 'AWS::Region']
+          METERING_MODE: !Ref MeteringMode
+          DEDUP_TTL_HOURS: '336'
+      Code: ./lambda-functions/metering_processor/
+      Tags:
+        - Key: Name
+          Value: gip-metering-processor
+        - Key: Purpose
+          Value: Server-side usage metering from Bedrock invocation logs
+        - Key: gip:service
+          Value: quota-metering
+        - Key: gip:cell
+          Value: !Sub '${AWS::AccountId}:${AWS::Region}'
+
+  # CloudWatch Logs must be allowed to invoke the processor. SourceArn uses a
+  # log-group wildcard (confined by SourceAccount) because in adopt mode the
+  # subscription attaches to the customer's pre-existing log group, whose name
+  # is only known at runtime via the custom resource.
+  MeteringSubscriptionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MeteringProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*:*'
+
+  MeteringSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    DependsOn: MeteringSubscriptionPermission
+    Properties:
+      # Custom resource returns the effective log group: ours when created,
+      # the customer's when adopted.
+      LogGroupName: !GetAtt MeteringLoggingConfig.LogGroupName
+      FilterPattern: ''
+      DestinationArn: !GetAtt MeteringProcessorFunction.Arn
+
+  # ============================================
+  # Alarms
+  # ============================================
+
+  MeteringProcessorErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-processor-errors'
+      AlarmDescription: Metering processor Lambda is failing — server-side usage is not being accrued in this region
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref MeteringProcessorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  MeteringProcessorDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-processor-dlq'
+      AlarmDescription: Metering processor DLQ has messages — failed batches need redrive (dedup markers and accrual commit in one transaction, so replays are idempotent)
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt MeteringProcessorDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  MeteringInvalidRecordsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-invalid-records'
+      AlarmDescription: Metering processor rejected malformed, missing-ID, invalid-token, or zero-token invocation records; server-side usage may be undercounted
+      Namespace: GIP/Metering
+      MetricName: InvalidRecords
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  # Bedrock publishes invocation-log delivery health metrics under AWS/Bedrock
+  # (ModelInvocationLogsCloudWatchDeliverySuccess/Failure).
+  BedrockDeliveryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-log-delivery-failure'
+      AlarmDescription: Bedrock failed to deliver model invocation logs to CloudWatch — usage in this region is under-metered
+      Namespace: AWS/Bedrock
+      MetricName: ModelInvocationLogsCloudWatchDeliveryFailure
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  # Governance-visibility tripwire for the bedrock-mantle endpoint. Mantle
+  # inference is invisible to model invocation logs (this stack's metering
+  # source) and to CloudTrail management events, and governed credentials
+  # carry an explicit DenyBedrockMantleEndpoint statement — so ANY activity in
+  # the AWS/BedrockMantle namespace means something in this account/region is
+  # using the unmetered endpoint outside governed paths. Mantle publishes
+  # metrics per Project dimension (no user identity), so a Metrics Insights
+  # query aggregates across all projects; a plain dimensionless metric alarm
+  # would never match.
+  MantleEndpointUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-mantle-endpoint-usage'
+      AlarmDescription: >-
+        bedrock-mantle inference detected in this account/region. Mantle traffic
+        is invisible to server-side metering (no invocation logs) and carries no
+        per-user identity, so this usage is outside quota governance. Governed
+        credentials deny bedrock-mantle:* — CUR/Cost Explorer mantle usage
+        types confirm account-level spend; use a CloudTrail data-event trail
+        for AWS::BedrockMantle::Project to identify the calling principal.
+      Metrics:
+        - Id: mantle_inferences
+          Label: Mantle inferences (all projects)
+          Expression: 'SELECT SUM(Inferences) FROM "AWS/BedrockMantle"'
+          Period: 300
+          ReturnData: true
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+Outputs:
+  InferenceCellId:
+    Description: Account and Region containing this metering stack and identifiable telemetry
+    Value: !Sub '${AWS::AccountId}:${AWS::Region}'
+
+  MeteringServiceName:
+    Description: Service-level attribution value applied to metering resources
+    Value: quota-metering
+
+  MeteringLogGroupName:
+    Description: Effective invocation log group being metered (managed, or adopted from an existing config)
+    Value: !GetAtt MeteringLoggingConfig.LogGroupName
+    Export:
+      Name: !Sub '${AWS::StackName}-MeteringLogGroupName'
+
+  MeteringProcessorFunctionArn:
+    Description: ARN of the metering processor Lambda
+    Value: !GetAtt MeteringProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-MeteringProcessorFunctionArn'
+
+  MeteringProcessorDLQUrl:
+    Description: URL of the metering processor dead-letter queue
+    Value: !Ref MeteringProcessorDLQ
+    Export:
+      Name: !Sub '${AWS::StackName}-MeteringProcessorDLQUrl'
+
+  MeteringModeValue:
+    Description: Metering mode this stack was deployed with (shadow or max)
+    Value: !Ref MeteringMode
+    Export:
+      Name: !Sub '${AWS::StackName}-MeteringMode'

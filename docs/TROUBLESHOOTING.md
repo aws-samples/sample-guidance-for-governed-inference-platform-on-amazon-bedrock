@@ -1,0 +1,1 @@
+../assets/docs/TROUBLESHOOTING.md

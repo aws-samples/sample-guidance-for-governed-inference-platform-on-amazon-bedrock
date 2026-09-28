@@ -1,0 +1,519 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CodeBuild for binary builds (Windows, Linux x64, Linux ARM64) - Claude Code w/ Bedrock'
+
+Parameters:
+  ProjectNamePrefix:
+    Type: String
+    Default: gip
+    Description: Prefix for the CodeBuild project name
+
+Resources:
+  # S3 Bucket for access logs
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: 'Dedicated server-access-log destination. AWS Security Hub control S3.9: "The target logging bucket does not need to have server access logging enabled, and you should suppress findings for this bucket." Logging a log bucket to itself is documented by AWS as an infinite loop and not recommended (S3 User Guide, enable-server-access-logging).'
+      guard:
+        SuppressedRules:
+          # Log destination bucket: self-logging would recurse. Object Lock is
+          # irreversible and lifecycle expiry manages retention. No ACL is
+          # configured (private default) and public access is fully blocked.
+          - S3_BUCKET_LOGGING_ENABLED
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 90
+      Tags:
+        - Key: Application
+          Value: GovernedInferencePlatform
+        - Key: Purpose
+          Value: AccessLogs
+
+  # Log delivery needs an explicit grant: with Object Ownership enforced
+  # (S3 default since April 2023) the log-delivery group ACL no longer
+  # applies, so without this policy BuildBucket's access logs are silently
+  # dropped. Same shape as analytics-pipeline.yaml plus aws:SourceArn.
+  LoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt LoggingBucket.Arn
+              - !Sub '${LoggingBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+          # S3 server access log delivery (BuildBucket LoggingConfiguration)
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${LoggingBucket.Arn}/build-logs/*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+              ArnLike:
+                aws:SourceArn: !GetAtt BuildBucket.Arn
+
+  # S3 Bucket for source and artifacts
+  BuildBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Object Lock is irreversible and wrong for a mutable build-artifact
+          # bucket with 7-day expiry; no ACL is configured (private default)
+          # and public access is fully blocked.
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: build-logs/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldBuilds
+            Status: Enabled
+            ExpirationInDays: 7
+            NoncurrentVersionExpirationInDays: 1
+      Tags:
+        - Key: Application
+          Value: GovernedInferencePlatform
+        - Key: Purpose
+          Value: BuildArtifacts
+
+  # IAM Role for CodeBuild
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Single-purpose policy scoped to this role and the build bucket -
+          # converting to a managed policy adds no security.
+          - IAM_NO_INLINE_POLICY_CHECK
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Scoped replacement for the former CloudWatchLogsFullAccess
+              # managed policy: this role runs build scripts from an S3
+              # source.zip and must not hold logs admin (DeleteLogGroup,
+              # PutRetentionPolicy, ...) on every log group in the account.
+              # Both ARN forms are required: the bare log-group ARN for
+              # CreateLogGroup/CreateLogStream and the :* form (what
+              # LogGroup.Arn returns) for PutLogEvents on streams.
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectNamePrefix}-windows-build'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectNamePrefix}-linux-x64-build'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectNamePrefix}-linux-arm64-build'
+                  - !GetAtt CodeBuildLogGroup.Arn
+                  - !GetAtt LinuxX64BuildLogGroup.Arn
+                  - !GetAtt LinuxArm64BuildLogGroup.Arn
+        - PolicyName: CodeBuildS3Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${BuildBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt BuildBucket.Arn
+      Tags:
+        - Key: Application
+          Value: GovernedInferencePlatform
+
+  # Log Groups
+  # Keep original logical ID to avoid CloudFormation replacement conflict
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      guard:
+        SuppressedRules:
+          # CloudWatch Logs encrypts at rest by default; KmsKeyId requires a
+          # customer-managed CMK (aws-managed keys unsupported).
+          - CLOUDWATCH_LOG_GROUP_ENCRYPTED
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectNamePrefix}-windows-build'
+      RetentionInDays: 7
+
+  LinuxX64BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      guard:
+        SuppressedRules:
+          # CloudWatch Logs encrypts at rest by default; KmsKeyId requires a
+          # customer-managed CMK (aws-managed keys unsupported).
+          - CLOUDWATCH_LOG_GROUP_ENCRYPTED
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectNamePrefix}-linux-x64-build'
+      RetentionInDays: 7
+
+  LinuxArm64BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      guard:
+        SuppressedRules:
+          # CloudWatch Logs encrypts at rest by default; KmsKeyId requires a
+          # customer-managed CMK (aws-managed keys unsupported).
+          - CLOUDWATCH_LOG_GROUP_ENCRYPTED
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectNamePrefix}-linux-arm64-build'
+      RetentionInDays: 7
+
+  # ============================================================
+  # Windows Build Project (Nuitka + MinGW)
+  # ============================================================
+  WindowsBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectNamePrefix}-windows-build'
+      Description: Build Windows binaries for Claude Code with Nuitka
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: S3
+        Location: !Ref BuildBucket
+        Name: windows-binaries.zip
+        Packaging: ZIP
+        OverrideArtifactName: false
+      # Artifacts are written with SSE-KMS under the AWS-managed aws/s3 key
+      # (CodeBuild's own default; the alias ARN just makes it explicit). Its
+      # key policy covers every principal in this account via S3, so the
+      # service role and the gip package/distribute downloaders need no
+      # extra kms:* grants.
+      EncryptionKey: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3'
+      Environment:
+        Type: WINDOWS_SERVER_2022_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/windows-base:2022-1.0
+        PrivilegedMode: false
+      Source:
+        Type: S3
+        Location: !Sub '${BuildBucket}/source.zip'
+        BuildSpec: |
+          version: 0.2
+
+          phases:
+            install:
+              commands:
+                - echo Starting Windows build environment setup...
+                - echo Installing Python 3.12...
+                - choco install python312 -y --no-progress
+                - echo Installing MinGW C compiler for Nuitka...
+                - choco install mingw -y --no-progress
+                - echo Checking Python version...
+                - C:\Python312\python.exe --version
+                - echo Checking pip version...
+                - C:\Python312\python.exe -m pip --version
+                - echo Checking gcc version...
+                - C:\ProgramData\mingw64\mingw64\bin\gcc.exe --version
+
+            pre_build:
+              commands:
+                - echo Installing build dependencies...
+                - C:\Python312\python.exe -m pip install --upgrade pip
+                - C:\Python312\python.exe -m pip install nuitka==2.7.12 ordered-set zstandard certifi
+                - Set-Content -Path 'C:\Python312\Lib\site-packages\sitecustomize.py' -Value 'import os; os.environ["SSL_CERT_FILE"]=r"C:\Python312\Lib\site-packages\certifi\cacert.pem"'
+                - echo Installing application dependencies...
+                - C:\Python312\python.exe -m pip install boto3 requests PyJWT cryptography charset_normalizer
+                - C:\Python312\python.exe -m pip install keyring pywin32
+                - C:\Python312\python.exe -m pip install questionary rich cleo pydantic pyyaml
+
+            build:
+              commands:
+                - echo Building Windows executables sequentially...
+                - echo Building credential-process Windows executable...
+                - $env:PATH = "C:\ProgramData\mingw64\mingw64\bin;" + $env:PATH; C:\Python312\python.exe -m nuitka --mingw64 --standalone --onefile --assume-yes-for-downloads --company-name="Claude Code" --product-name="Claude Code Credential Process" --file-version="1.0.0.0" --product-version="1.0.0.0" --windows-file-description="AWS Credential Process for Claude Code" --include-package=keyring.backends --include-package=charset_normalizer --output-filename=credential-process-windows.exe --output-dir=. --remove-output source/credential_provider/__main__.py
+                - echo Building otel-helper Windows executable...
+                - $env:PATH = "C:\ProgramData\mingw64\mingw64\bin;" + $env:PATH; C:\Python312\python.exe -m nuitka --mingw64 --standalone --onefile --assume-yes-for-downloads --company-name="Claude Code" --product-name="Claude Code OTEL Helper" --file-version="1.0.0.0" --product-version="1.0.0.0" --windows-file-description="OpenTelemetry Helper for Claude Code" --output-filename=otel-helper-windows.exe --output-dir=. --remove-output source/otel_helper/__main__.py
+            post_build:
+              commands:
+                - echo Build completed
+                - echo Validating all required binaries exist...
+                # PowerShell commands containing ': ' and '{ }' must be YAML-quoted, or
+                # CodeBuild's buildspec parser reads them as mappings ("found subkeys").
+                # Single quotes keep the inner PowerShell double quotes and $(...) intact;
+                # the literal single quotes around 'gip package --go' are doubled per YAML.
+                - 'if (-not (Test-Path credential-process-windows.exe)) { Write-Error "FATAL: credential-process-windows.exe was not built. Nuitka compilation failed."; exit 1 }'
+                - 'if (-not (Test-Path otel-helper-windows.exe)) { Write-Error "FATAL: otel-helper-windows.exe was not built. Nuitka compilation failed. Consider using ''gip package --go'' for reliable Go-based builds."; exit 1 }'
+                - 'Get-ChildItem *.exe | ForEach-Object { Write-Host "$($_.Name) - $([math]::Round($_.Length/1MB, 1)) MB" }'
+
+          artifacts:
+            files:
+              - credential-process-windows.exe
+              - otel-helper-windows.exe
+            name: windows-binaries
+
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref CodeBuildLogGroup
+      TimeoutInMinutes: 30
+      Tags:
+        - Key: Application
+          Value: GovernedInferencePlatform
+        - Key: Purpose
+          Value: WindowsBinaryBuild
+
+  # ============================================================
+  # Linux x64 Build Project (PyInstaller)
+  # ============================================================
+  LinuxX64BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectNamePrefix}-linux-x64-build'
+      Description: Build Linux x64 binaries for Claude Code with PyInstaller
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: S3
+        Location: !Ref BuildBucket
+        Name: linux-x64-binaries.zip
+        Packaging: ZIP
+        OverrideArtifactName: false
+      # Artifacts are written with SSE-KMS under the AWS-managed aws/s3 key
+      # (CodeBuild's own default; the alias ARN just makes it explicit). Its
+      # key policy covers every principal in this account via S3, so the
+      # service role and the gip package/distribute downloaders need no
+      # extra kms:* grants.
+      EncryptionKey: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3'
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: false
+      Source:
+        Type: S3
+        Location: !Sub '${BuildBucket}/source.zip'
+        BuildSpec: |
+          version: 0.2
+
+          phases:
+            install:
+              runtime-versions:
+                python: 3.12
+              commands:
+                - echo Starting Linux x64 build environment setup...
+                - python3 --version
+                - pip3 --version
+
+            pre_build:
+              commands:
+                - echo Installing build dependencies...
+                - pip3 install --upgrade pip
+                - pip3 install pyinstaller==6.3.0
+                - echo Installing application dependencies...
+                - pip3 install boto3 requests PyJWT cryptography keyring
+                - pip3 install SecretStorage jeepney
+
+            build:
+              commands:
+                - echo Building Linux x64 executables...
+                - echo Building credential-process...
+                - python3 -m PyInstaller --onefile --clean --noconfirm --name=credential-process-linux-x64 --distpath=. --workpath=/tmp/pyinstaller --specpath=/tmp/pyinstaller --log-level=WARN --hidden-import=keyring.backends.SecretService --hidden-import=keyring.backends.chainer --hidden-import=charset_normalizer --hidden-import=six --hidden-import=six.moves --hidden-import=six.moves._thread --hidden-import=six.moves.urllib --hidden-import=six.moves.urllib.parse --hidden-import=dateutil source/credential_provider/__main__.py
+                - echo Building otel-helper...
+                - python3 -m PyInstaller --onefile --clean --noconfirm --name=otel-helper-linux-x64 --distpath=. --workpath=/tmp/pyinstaller --specpath=/tmp/pyinstaller --log-level=WARN source/otel_helper/__main__.py
+
+            post_build:
+              commands:
+                - echo Build completed successfully
+                - ls -lh credential-process-linux-x64 otel-helper-linux-x64
+                - chmod +x credential-process-linux-x64 otel-helper-linux-x64
+
+          artifacts:
+            files:
+              - credential-process-linux-x64
+              - otel-helper-linux-x64
+            name: linux-x64-binaries
+
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref LinuxX64BuildLogGroup
+      TimeoutInMinutes: 30
+      Tags:
+        - Key: Application
+          Value: GovernedInferencePlatform
+        - Key: Purpose
+          Value: LinuxX64BinaryBuild
+
+  # ============================================================
+  # Linux ARM64 Build Project (PyInstaller)
+  # ============================================================
+  LinuxArm64BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectNamePrefix}-linux-arm64-build'
+      Description: Build Linux ARM64 binaries for Claude Code with PyInstaller
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: S3
+        Location: !Ref BuildBucket
+        Name: linux-arm64-binaries.zip
+        Packaging: ZIP
+        OverrideArtifactName: false
+      # Artifacts are written with SSE-KMS under the AWS-managed aws/s3 key
+      # (CodeBuild's own default; the alias ARN just makes it explicit). Its
+      # key policy covers every principal in this account via S3, so the
+      # service role and the gip package/distribute downloaders need no
+      # extra kms:* grants.
+      EncryptionKey: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3'
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/amazonlinux2-aarch64-standard:3.0
+        PrivilegedMode: false
+      Source:
+        Type: S3
+        Location: !Sub '${BuildBucket}/source.zip'
+        BuildSpec: |
+          version: 0.2
+
+          phases:
+            install:
+              runtime-versions:
+                python: 3.12
+              commands:
+                - echo Starting Linux ARM64 build environment setup...
+                - python3 --version
+                - pip3 --version
+
+            pre_build:
+              commands:
+                - echo Installing build dependencies...
+                - pip3 install --upgrade pip
+                - pip3 install pyinstaller==6.3.0
+                - echo Installing application dependencies...
+                - pip3 install boto3 requests PyJWT cryptography keyring
+                - pip3 install SecretStorage jeepney || true
+
+            build:
+              commands:
+                - echo Building Linux ARM64 executables...
+                - echo Building credential-process...
+                - python3 -m PyInstaller --onefile --clean --noconfirm --name=credential-process-linux-arm64 --distpath=. --workpath=/tmp/pyinstaller --specpath=/tmp/pyinstaller --log-level=WARN --hidden-import=keyring.backends.SecretService --hidden-import=keyring.backends.chainer --hidden-import=charset_normalizer --hidden-import=six --hidden-import=six.moves --hidden-import=six.moves._thread --hidden-import=six.moves.urllib --hidden-import=six.moves.urllib.parse --hidden-import=dateutil source/credential_provider/__main__.py
+                - echo Building otel-helper...
+                - python3 -m PyInstaller --onefile --clean --noconfirm --name=otel-helper-linux-arm64 --distpath=. --workpath=/tmp/pyinstaller --specpath=/tmp/pyinstaller --log-level=WARN source/otel_helper/__main__.py
+
+            post_build:
+              commands:
+                - echo Build completed successfully
+                - ls -lh credential-process-linux-arm64 otel-helper-linux-arm64
+                - chmod +x credential-process-linux-arm64 otel-helper-linux-arm64
+
+          artifacts:
+            files:
+              - credential-process-linux-arm64
+              - otel-helper-linux-arm64
+            name: linux-arm64-binaries
+
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref LinuxArm64BuildLogGroup
+      TimeoutInMinutes: 30
+      Tags:
+        - Key: Application
+          Value: GovernedInferencePlatform
+        - Key: Purpose
+          Value: LinuxArm64BinaryBuild
+
+Outputs:
+  BuildBucket:
+    Description: S3 bucket for build source and artifacts
+    Value: !Ref BuildBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BuildBucket'
+
+  BuildBucketArn:
+    Description: ARN of the build bucket
+    Value: !GetAtt BuildBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BuildBucketArn'
+
+  ProjectName:
+    Description: CodeBuild project name (Windows)
+    Value: !Ref WindowsBuildProject
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  ProjectArn:
+    Description: CodeBuild project ARN (Windows)
+    Value: !GetAtt WindowsBuildProject.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectArn'
+
+  LinuxX64ProjectName:
+    Description: CodeBuild project name (Linux x64)
+    Value: !Ref LinuxX64BuildProject
+    Export:
+      Name: !Sub '${AWS::StackName}-LinuxX64ProjectName'
+
+  LinuxArm64ProjectName:
+    Description: CodeBuild project name (Linux ARM64)
+    Value: !Ref LinuxArm64BuildProject
+    Export:
+      Name: !Sub '${AWS::StackName}-LinuxArm64ProjectName'
+
+  ServiceRoleArn:
+    Description: CodeBuild service role ARN
+    Value: !GetAtt CodeBuildServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceRoleArn'

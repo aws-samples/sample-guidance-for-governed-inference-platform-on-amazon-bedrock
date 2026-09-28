@@ -1,0 +1,1 @@
+../assets/docs/APPS_GATEWAY.md

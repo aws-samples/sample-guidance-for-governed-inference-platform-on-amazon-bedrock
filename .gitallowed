@@ -1,0 +1,12 @@
+# git-secrets allow-list (see https://github.com/awslabs/git-secrets)
+# Public AWS Elastic Load Balancing log-delivery account IDs per region
+# (https://docs.aws.amazon.com/elasticloadbalancing/latest/application/enable-access-logging.html)
+deployment/infrastructure/landing-page-distribution.yaml:.*AccountId
+\.claude/rules/region-availability\.md:.*AccountId
+# AWS documentation example account IDs and obviously synthetic fixture IDs
+123456789012
+111122223333
+444455556666
+777788889999
+111111111111
+222222222222

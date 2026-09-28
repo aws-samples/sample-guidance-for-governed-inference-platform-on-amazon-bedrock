@@ -1,0 +1,1 @@
+../assets/docs/MULTI_ACCOUNT.md

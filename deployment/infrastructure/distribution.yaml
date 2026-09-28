@@ -1,0 +1,238 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Distribution infra - S3 bucket and IAM for package distribution'
+
+Parameters:
+  IdentityPoolName:
+    Type: String
+    Default: gip
+    Description: Name prefix for resources (from identity pool name)
+
+Resources:
+  # S3 Bucket for access logs
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: 'Dedicated server-access-log destination. AWS Security Hub control S3.9: "The target logging bucket does not need to have server access logging enabled, and you should suppress findings for this bucket." Logging a log bucket to itself is documented by AWS as an infinite loop and not recommended (S3 User Guide, enable-server-access-logging).'
+      guard:
+        SuppressedRules:
+          # Log destination bucket: self-logging would recurse. Object Lock is
+          # irreversible and lifecycle expiry manages retention. No ACL is
+          # configured (private default) and public access is fully blocked.
+          - S3_BUCKET_LOGGING_ENABLED
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+    Properties:
+      BucketName: !Sub '${IdentityPoolName}-distribution-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 90
+      Tags:
+        - Key: Application
+          Value: GovernedInferencePlatform
+        - Key: Purpose
+          Value: DistributionAccessLogs
+
+  # Log delivery needs an explicit grant: with Object Ownership enforced
+  # (S3 default since April 2023) the log-delivery group ACL no longer
+  # applies, so without this policy DistributionBucket's access logs are
+  # silently dropped. Same shape as analytics-pipeline.yaml plus aws:SourceArn.
+  LoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt LoggingBucket.Arn
+              - !Sub '${LoggingBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+          # S3 server access log delivery (DistributionBucket LoggingConfiguration)
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${LoggingBucket.Arn}/package-downloads/*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+              ArnLike:
+                aws:SourceArn: !GetAtt DistributionBucket.Arn
+
+  # S3 Bucket for package distribution
+  DistributionBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      guard:
+        SuppressedRules:
+          # Object Lock is irreversible and wrong for a mutable package
+          # distribution bucket; no ACL is configured (private default) and
+          # public access is fully blocked.
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED
+          - S3_BUCKET_NO_PUBLIC_RW_ACL
+    Properties:
+      BucketName: !Sub '${IdentityPoolName}-distribution-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: package-downloads/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldPackages
+            Status: Enabled
+            Prefix: packages/
+            ExpirationInDays: 30
+            NoncurrentVersionExpirationInDays: 7
+          - Id: DeleteOldWindowsBuilds
+            Status: Enabled
+            Prefix: windows-builds/
+            ExpirationInDays: 7
+            NoncurrentVersionExpirationInDays: 1
+      Tags:
+        - Key: Application
+          Value: GovernedInferencePlatform
+        - Key: Purpose
+          Value: PackageDistribution
+
+  # IAM User for distribution (presigned URLs)
+  DistributionGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: !Sub '${IdentityPoolName}-distributors'
+
+  DistributionUser:
+    Type: AWS::IAM::User
+    Metadata:
+      guard:
+        SuppressedRules:
+          # False positive: this user has no LoginProfile at all (programmatic
+          # access-key-only user, no console password exists) - the rule
+          # errors on the absent property. The registry filter only honors the
+          # parent rule name (NO_PLAINTEXT_PASSWORD); the USES_SECURE_PARAMETER
+          # sub-rule is what scanners report, so both names are listed.
+          - IAM_USER_LOGIN_PROFILE_NO_PLAINTEXT_PASSWORD
+          - IAM_USER_LOGIN_PROFILE_USES_SECURE_PARAMETER
+    Properties:
+      UserName: !Sub '${IdentityPoolName}-distributor'
+      Groups:
+        - !Ref DistributionGroup
+      Tags:
+        - Key: Application
+          Value: GovernedInferencePlatform
+        - Key: Purpose
+          Value: GeneratePresignedURLs
+
+  # Access key for distribution user
+  DistributionUserAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref DistributionUser
+
+  # Policy for distribution user - only read access to packages
+  DistributionUserPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: DistributionUserS3ReadPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub '${DistributionBucket.Arn}/packages/*'
+      Users:
+        - !Ref DistributionUser
+
+  # Secret to store distribution user credentials
+  DistributionUserSecret:
+    Type: AWS::SecretsManager::Secret
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_149
+            comment: Encrypted with the AWS-managed key (aws/secretsmanager) - a customer-managed CMK adds key cost and key-policy management without a threat-model benefit here
+      guard:
+        SuppressedRules:
+          # Encrypted with the AWS-managed key (aws/secretsmanager). Rotation
+          # would require a custom rotation Lambda that also reissues the IAM
+          # access key; key rotation is a documented manual redeploy step.
+          - SECRETSMANAGER_USING_CMK
+          - SECRETSMANAGER_ROTATION_ENABLED_CHECK
+    Properties:
+      Name: !Sub '${IdentityPoolName}-distributor-credentials'
+      Description: IAM credentials for generating long-lived presigned URLs
+      SecretString: !Sub |
+        {
+          "AccessKeyId": "${DistributionUserAccessKey}",
+          "SecretAccessKey": "${DistributionUserAccessKey.SecretAccessKey}"
+        }
+      Tags:
+        - Key: Application
+          Value: GovernedInferencePlatform
+        - Key: Purpose
+          Value: DistributionCredentials
+
+Outputs:
+  DistributionBucket:
+    Description: S3 bucket for package distribution
+    Value: !Ref DistributionBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionBucket'
+
+  DistributionBucketArn:
+    Description: ARN of the distribution bucket
+    Value: !GetAtt DistributionBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionBucketArn'
+
+  DistributionSecretArn:
+    Description: ARN of the Secrets Manager secret containing distribution credentials
+    Value: !Ref DistributionUserSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionSecretArn'
+
+  DistributionSecretName:
+    Description: Name of the Secrets Manager secret containing distribution credentials
+    Value: !Sub '${IdentityPoolName}-distributor-credentials'
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionSecretName'
+
+  LoggingBucket:
+    Description: S3 bucket for access logs
+    Value: !Ref LoggingBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-LoggingBucket'
