@@ -9,8 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-# AWS regions where the Amazon Bedrock AgentCore managed Web Search connector
-# is available. Extend this list as regional availability expands.
+# Regions where gip deploys the web search gateway. AWS also lists the managed
+# Web Search connector in eu-west-1 and ap-northeast-1 (checked 2026-09-29);
+# they are not validated here, so they are not listed.
 WEBSEARCH_SUPPORTED_REGIONS = ["us-east-1"]
 
 # IAM user guide for obtaining an OIDC provider certificate thumbprint. Referenced by

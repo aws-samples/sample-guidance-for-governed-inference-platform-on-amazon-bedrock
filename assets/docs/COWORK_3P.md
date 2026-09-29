@@ -376,7 +376,7 @@ That mode reads the cached id_token and silently refreshes it via the stored ref
 
 ### Things to know
 
-- **Region:** the managed Web Search connector is currently available in **`us-east-1` only**, so the gateway is deployed there regardless of your other stacks' region.
+- **Region:** `gip` deploys the web search gateway in **`us-east-1` only**, regardless of your other stacks' region. AWS also lists the managed Web Search connector in `eu-west-1` and `ap-northeast-1`, which this repository has not validated (see [WEB_SEARCH.md](WEB_SEARCH.md)).
 - **Data residency:** web search queries (or fragments of user prompts) are processed in `us-east-1`. Review compliance impact for regulated workloads before enabling.
 - **Cost:** approximately **$7 per 1,000 queries**, billed to your AWS account.
 - **Identity providers:** works with the solution's OIDC providers (Amazon Cognito, Microsoft Entra ID, Okta, Auth0, Google, generic OIDC). Because the bearer is an id_token (`aud = clientId`) validated by `AllowedAudience`, **no provider-specific setup is required**. See [Microsoft Entra ID setup → web search](providers/microsoft-entra-id-setup.md#10-web-search-for-claude-cowork-entra-id-notes) for notes.

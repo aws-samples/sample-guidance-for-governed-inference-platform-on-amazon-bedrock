@@ -15,7 +15,7 @@ Windows and macOS receive extra testing attention due to historical platform-spe
 | #649 | Windows | DPAPI keyring retrieval taking 10-17s |
 | #664 | macOS | ARM64 binary detection / Rosetta fallback |
 
-Profiles 13-16 specifically target these platforms with stress scenarios (keyring chunking under load, sidecar monitoring, quota enforcement). The PR canary runs both Linux (profile 01) and Windows (profile 04) to catch regressions before merge.
+Profiles 13-16 specifically target these platforms with stress scenarios (keyring chunking under load, sidecar monitoring, quota enforcement). For a quick cross-platform check before merging, run profile 01 (Linux) and profile 04 (Windows).
 
 ## How It Works
 

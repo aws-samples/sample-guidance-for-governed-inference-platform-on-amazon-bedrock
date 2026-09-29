@@ -4,13 +4,13 @@ version = "2.5.2"
 description = "Deploy and manage a governed AI inference platform on Amazon Bedrock"
 authors = ["Governed Inference Platform Team <gip@example.com>"]
 readme = "../README.md"
-license = "MIT"
+license = "MIT-0"
 keywords = ["aws", "bedrock", "ai", "inference", "governance", "authentication", "monitoring"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: System Administrators",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: MIT No Attribution License (MIT-0)",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -61,6 +61,7 @@ types-requests = "*"
 pre-commit = "^4.5.1"
 cfn-lint = "^1.48.1"
 yamllint = "^1.38.0"
+tenacity = "^9.1.4"  # live E2E harness (tests/e2e/conftest.py)
 
 [build-system]
 requires = ["poetry-core"]

@@ -64,7 +64,7 @@ search charges into per-user budget enforcement.
 ## Prerequisites
 
 - This solution already deployed with an OIDC identity provider (the Web Search gateway reuses it for inbound auth).
-- Deployment into **`us-east-1`**, the only Region the `gip` CLI allows for web search. AWS lists additional Web Search Tool Regions (checked 2026-09-25) that this repository has not validated.
+- Deployment into **`us-east-1`**, the only Region the `gip` CLI allows for web search. The [Web Search Tool connector page](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-target-connector-web-search-tool.html) also lists `eu-west-1` and `ap-northeast-1` (checked 2026-09-29), while the [AgentCore harness tools page](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/harness-tools.html) still gives `us-east-1` only for harness use. This repository has not validated the other Regions.
 
 ## Deployment
 

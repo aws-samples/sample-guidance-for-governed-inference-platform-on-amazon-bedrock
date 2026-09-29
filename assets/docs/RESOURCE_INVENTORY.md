@@ -535,7 +535,7 @@ gitignored and verified by the fetch script (ADR-0036).
 
 **Template:** `bedrock-agentcore-gateway.yaml`
 **Required:** No (optional, for MCP web search tool via Bedrock AgentCore)
-**Region restriction:** us-east-1 only (managed connector availability)
+**Region restriction:** us-east-1 only (the only Region `gip` allows for web search; see [WEB_SEARCH.md](WEB_SEARCH.md))
 
 | Resource Type | Service Namespace | Count |
 |---|---|---|

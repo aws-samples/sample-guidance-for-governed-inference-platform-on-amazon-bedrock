@@ -516,7 +516,8 @@ def test_sync_rejects_upstream_license_symlink_without_copying_target(tmp_path):
 def test_sync_workflow_separates_untrusted_tests_from_pr_credentials():
     workflow = (REPO_ROOT / ".github" / "workflows" / "sync-claude-apps-gateway.yml").read_text(encoding="utf-8")
 
-    assert "ref: beta" in workflow
+    assert "ref: main" in workflow
+    assert "beta" not in workflow
     assert "persist-credentials: false" in workflow
     assert "open-review-pr:" in workflow
     assert "needs: validate" in workflow

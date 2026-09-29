@@ -1,5 +1,5 @@
 {
-  "description": "Binary size budgets (bytes). Fail CI if exceeded.",
+  "description": "Binary size budgets (bytes) for the Go binaries. No workflow in this sample reads this file; compare release binaries against it in your own CI.",
   "budgets": {
     "credential-process-linux-amd64": 26214400,
     "credential-process-darwin-arm64": 26214400,

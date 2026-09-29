@@ -91,7 +91,7 @@ stacks output (copy them from the earlier stack's **Outputs** tab).
 | `model-lifecycle.yaml` | Model end-of-life / legacy-pricing alert ladder | `gip-model-lifecycle` | None; optionally reuse an existing SNS topic | [launch][l-lifecycle] |
 | `landing-page-distribution.yaml` | Authenticated package-download landing page (ALB + Lambda) | `gip-landing-page` | VPC with public+private subnets, custom domain + ACM, IdP web app. Serves packages produced by `gip package` | [launch][l-landing] |
 | `skills-registry.yaml` | Governed skills registry (review sources + approved artifacts) | `gip-skills-registry` | Optional plugins bucket; IdP federation for group-gated roles. See [SKILLS_REGISTRY.md](SKILLS_REGISTRY.md) | [launch][l-skills] |
-| `bedrock-agentcore-gateway.yaml` | AgentCore gateway with managed web search for CoWork | `gip-websearch-gateway` | **us-east-1 only** (web search connector region). See [WEB_SEARCH.md](WEB_SEARCH.md) | [launch][l-websearch] |
+| `bedrock-agentcore-gateway.yaml` | AgentCore gateway with managed web search for CoWork | `gip-websearch-gateway` | **us-east-1 only** (the only Region `gip` allows for web search). See [WEB_SEARCH.md](WEB_SEARCH.md) | [launch][l-websearch] |
 
 Replace `<YOUR_BUCKET>` and `<REGION>` in the link definitions below with your
 values — or simply paste the output of `scripts/publish-templates.sh`, which

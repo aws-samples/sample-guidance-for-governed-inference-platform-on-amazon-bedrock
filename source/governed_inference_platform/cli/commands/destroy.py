@@ -316,7 +316,7 @@ class DestroyCommand(Command):
             # CodeBuild may have been deployed cross-region (Windows container fleet
             # isn't in every region); delete it where it actually lives, or it's
             # silently orphaned in the build region while the destroy reports success.
-            # Web search likewise deploys into us-east-1 (managed connector region);
+            # Web search likewise deploys into us-east-1 (the only Region gip allows for it);
             # memory attaches to that gateway and lives in the same region.
             if stack == "codebuild":
                 stack_region = get_codebuild_region(profile)

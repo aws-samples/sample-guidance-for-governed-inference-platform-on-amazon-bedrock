@@ -524,14 +524,16 @@ aws cognito-idp list-user-pool-client-secrets \
   --user-pool-id "$POOL_ID" --client-id "$CLIENT_ID"
 
 # 2. Add a second secret — Cognito generates it; BOTH secrets stay valid
-aws cognito-idp add-user-pool-client-secret \
+NEW_SECRET=$(aws cognito-idp add-user-pool-client-secret \
   --user-pool-id "$POOL_ID" --client-id "$CLIENT_ID" \
-  --query 'ClientSecretDescriptor.ClientSecretValue' --output text
+  --query 'ClientSecretDescriptor.ClientSecretValue' --output text)
 
 # 3. Store the new value under the SAME secret name the distribution stack reads
-aws secretsmanager put-secret-value \
+#    (sent on stdin, so it stays out of shell history and the process list)
+[ -n "$NEW_SECRET" ] && printf '%s' "$NEW_SECRET" | aws secretsmanager put-secret-value \
   --secret-id gip-user-pool-distribution-web-client-secret \
-  --secret-string '<value from step 2>'
+  --secret-string file:///dev/stdin
+unset NEW_SECRET
 
 # 4. Redeploy the distribution stack so the ALB listener re-resolves the secret
 poetry run gip deploy distribution
@@ -611,8 +613,10 @@ If it does, use the zero-downtime sequence below:
    `OidcClientSecretArn` you passed at deploy:
 
    ```bash
-   aws secretsmanager put-secret-value \
-     --secret-id <secret-arn> --secret-string '<new client secret>'
+   read -rs NEW_SECRET   # paste the new client secret; input is not echoed
+   printf '%s' "$NEW_SECRET" | aws secretsmanager put-secret-value \
+     --secret-id <secret-arn> --secret-string file:///dev/stdin
+   unset NEW_SECRET
    ```
 
 3. Restart tasks so ECS injects the new value:
@@ -651,9 +655,9 @@ Rotate on suspected compromise, or to force-invalidate **all** active gateway
 sessions (see offboarding, section 8):
 
 ```bash
-aws secretsmanager put-secret-value \
+openssl rand -base64 36 | tr -d '\n' | aws secretsmanager put-secret-value \
   --secret-id <JwtSecretArn stack output> \
-  --secret-string "$(openssl rand -base64 36)"
+  --secret-string file:///dev/stdin
 aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --force-new-deployment
 ```
 

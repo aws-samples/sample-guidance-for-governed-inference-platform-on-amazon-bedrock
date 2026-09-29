@@ -21,8 +21,6 @@ Drift this prevents:
 
 from pathlib import Path
 
-import pytest
-
 SOURCE_ROOT = Path(__file__).parent.parent
 GO_MAIN = SOURCE_ROOT / "go" / "cmd" / "credential-process" / "main.go"
 PY_MAIN = SOURCE_ROOT / "credential_provider" / "__main__.py"
@@ -117,7 +115,6 @@ class TestCredentialProcessFeatureParity:
     """Track feature parity between Go and Python — these may intentionally diverge
     but the test documents which features exist in which implementation."""
 
-    @pytest.mark.xfail(reason="PR #447 pending review — refresh_token not yet in beta")
     def test_go_has_refresh_token_support(self):
         """Go binary should have refresh_token persistence (PR #447)."""
         go_code = GO_MAIN.read_text(encoding="utf-8")

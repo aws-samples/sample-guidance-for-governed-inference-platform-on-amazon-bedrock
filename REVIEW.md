@@ -108,7 +108,7 @@ addressed, and which remain follow-ups.
 
 13. **Model catalog is hardcoded** **PARTIALLY ADDRESSED** (`c111a10`, `gip models check` drift detection; `f972ae5`/`17bd382`, lifecycle dates + EOL warnings, `--propose` codegen as the system of record, additive `extra_models` overlay, and a daily `model-lifecycle.yaml` alert ladder — ADR-0018; full dynamic discovery deliberately rejected as catalog forking).  (`models.py:_CLAUDE_MODELS_RAW`, ~1,150
     lines, plus two manually-synced preference lists at `models.py:1635` and
-    `:1720`). Every model launch is a repo PR + client re-package. The CI
+    `:1720`). Every model launch is a repo PR + client re-package. The live-API
     validator (`scripts/validate_bedrock_regions.py`) proves runtime
     discovery via `ListInferenceProfiles` is feasible.
 14. **No non-interactive admin plane** **RESOLVED** (`4665024`, `gip init --from-file` + `--export-answers`). : `init` is a ~30-question wizard with
