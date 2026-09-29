@@ -66,11 +66,12 @@
 #     failure through the real install.bat entry point.
 #
 # The run starts install.bat from PowerShell 7 (pwsh -> cmd.exe -> powershell.exe),
-# so it also guards the PSModulePath isolation in install.bat and otel-helper.cmd.
+# so it also guards install.bat's PSModulePath isolation. The packaged
+# otel-helper.cmd is a stub here; the real helper's PowerShell fallback is
+# exercised by test_windows_installer_transaction.py in the Windows pytest job.
 #
 # COST CONTROL: workflow_dispatch plus PRs that touch the installer generator,
-# its guarded tests, the packaged otel-helper.cmd, or this workflow. Never runs
-# on plain pushes.
+# its guarded tests, or this workflow. Never runs on plain pushes.
 
 name: Windows Installer E2E (standard user)
 
@@ -81,7 +82,6 @@ on:
     paths:
       - 'source/governed_inference_platform/cli/commands/package.py'
       - 'source/tests/cli/commands/test_windows_installer_transaction.py'
-      - 'source/otel_helper/otel-helper.cmd'
       - '.github/workflows/windows-installer-e2e.yml'
 
 permissions:

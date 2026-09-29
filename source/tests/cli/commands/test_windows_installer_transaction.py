@@ -4,6 +4,7 @@
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -235,3 +236,34 @@ def test_generated_batch_executes_end_to_end_with_spaced_userprofile(tmp_path):
     assert "__CREDENTIAL_PROCESS_PATH__" not in (home / "gip" / "harnesses" / "opencode" / "opencode.json").read_text(
         encoding="utf-8"
     )
+
+
+def test_otel_helper_cmd_fallback_emits_json_under_a_powershell7_module_path(tmp_path):
+    """The real otel-helper.cmd, without otel-helper.exe, must still print JSON when the
+    caller's PSModulePath lists PowerShell 7 modules first (Claude Code started from pwsh)."""
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        pytest.skip("PowerShell 7 is not installed")
+    helper_dir = Path(__file__).parents[3] / "otel_helper"
+    install = tmp_path / "home" / "gip"
+    install.mkdir(parents=True)
+    for name in ("otel-helper.cmd", "otel-helper.ps1"):
+        shutil.copyfile(helper_dir / name, install / name)
+    ps7_modules = str(Path(pwsh).parent / "Modules")
+    env = {**os.environ, "USERPROFILE": str(tmp_path / "home")}
+    env["PSModulePath"] = ps7_modules + ";" + os.environ.get("PSModulePath", "")
+
+    result = subprocess.run(  # nosec B603 -- fixed argv, test-controlled input
+        ["cmd.exe", "/d", "/c", str(install / "otel-helper.cmd"), "--profile", "e2e"],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert json.loads(result.stdout) == {}
+    assert "CommandNotFoundException" not in result.stderr
+    assert (tmp_path / "home" / ".gip-session" / "e2e-otel-headers.json").is_file()
