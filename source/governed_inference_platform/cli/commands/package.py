@@ -5674,7 +5674,8 @@ echo   OK Ownership manifest recorded
 
 echo.
 echo ======================================
-echo Installation complete!
+REM ^^! prints a literal ! because this script runs with delayed expansion enabled.
+echo Installation complete^^!
 echo ======================================
 echo.
 echo Available profiles:
@@ -5705,7 +5706,8 @@ exit /b 0
             installer_content += f"""
 echo.
 echo ======================================
-echo Installation complete!
+REM ^^! prints a literal ! because this script runs with delayed expansion enabled.
+echo Installation complete^^!
 echo ======================================
 echo.
 echo Available profiles:

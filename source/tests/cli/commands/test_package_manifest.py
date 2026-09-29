@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -698,7 +699,7 @@ def test_windows_manifest_is_recorded_before_success_prompt(tmp_path):
     )
 
     preflight = (tmp_path / "gip-install.ps1").read_text(encoding="utf-8")
-    assert installer.index("-InstallAll") < installer.index("Installation complete!")
+    assert installer.index("-InstallAll") < installer.index("echo Installation complete")
     assert "aws_sso_sessions" in preflight
     assert preflight.index("$manifestStaged") < preflight.index("Invoke-GipFileTransaction $entries")
 
@@ -731,6 +732,25 @@ def test_windows_installer_clears_psmodulepath_before_any_powershell(tmp_path):
         i for i, line in enumerate(lines) if "powershell" in line.lower() and not line.startswith("REM")
     )
     assert lines.index("SETLOCAL ENABLEDELAYEDEXPANSION") < clear < first_powershell
+
+
+@pytest.mark.parametrize(
+    "profile_factory", [_make_oidc_central_profile, _make_oidc_sidecar_profile, _make_idc_zero_binary_profile]
+)
+def test_windows_installer_has_no_unescaped_bang_under_delayed_expansion(tmp_path, profile_factory):
+    """install.bat runs with ENABLEDELAYEDEXPANSION, where a bare ``!`` is dropped (or starts a
+    variable reference), so the success banner printed "Installation complete" without its ``!``."""
+    installer = PackageCommand()._create_windows_installer(tmp_path, profile_factory()).read_text(encoding="utf-8")
+    offending = []
+    for line in installer.splitlines():
+        stripped = line.strip()
+        if stripped.upper().startswith("REM") or "!" not in stripped:
+            continue
+        without_references = re.sub(r"![A-Za-z_][A-Za-z0-9_]*(:[^!]*)?!", "", stripped)
+        if "!" in without_references.replace("^^!", ""):
+            offending.append(stripped)
+    assert offending == []
+    assert "echo Installation complete^^!" in installer
 
 
 def test_otel_helper_cmd_clears_psmodulepath_before_powershell_fallback():

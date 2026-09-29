@@ -191,6 +191,7 @@ def test_install_all_rejects_duplicate_aws_sections_without_committing(tmp_path)
         cwd=tmp_path,
         capture_output=True,
         text=True,
+        env=_install_bat_environment(),
         check=False,
     )
 
