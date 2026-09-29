@@ -1,0 +1,32 @@
+# gitleaks configuration for .github/workflows/secret-scan.yml.
+# Uses the default gitleaks rule set. The allowlists below cover only
+# synthetic test values, each matched exactly, so a new real secret anywhere
+# in the repository (including in these files) is still reported.
+title = "Governed Inference Platform secret scan"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "detect-secrets baseline entries: SHA-1 hashes of already-reviewed findings, not secrets"
+# Matched on the whole line, with no path condition: in gitleaks 8.30.1 a path
+# in an allowlist suppresses the entire file even with condition = "AND".
+regexTarget = "line"
+regexes = ['''^\s*"hashed_secret": "[0-9a-f]{40}",?\s*$''']
+
+[[allowlists]]
+description = "Unsigned test JWTs (alg: none) cannot authenticate anything"
+regexes = ['''^eyJhbGciOiJub25l''']
+
+[[allowlists]]
+description = "Synthetic fixture and tutorial values (tree and project history)"
+regexes = [
+  '''^sk-1234567890$''',
+  '''^0123456789abcdef0123456789abcdef$''',
+  '''^aus123456789$''',
+  '''^abc123-def456-789$''',
+  # base64 of "claude-gateway-jwt-secret-for-testing-2024"
+  '''^Y2xhdWRlLWdhdGV3YXktand0LXNlY3JldC1mb3ItdGVzdGluZy0yMDI0$''',
+  # base64 of "test-secret-that-is-at-least-32-bytes"
+  '''^dGVzdC1zZWNyZXQtdGhhdC1pcy1hdC1sZWFzdC0zMi1ieXRlcw==$''',
+]

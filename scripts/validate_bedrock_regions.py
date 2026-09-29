@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ABOUTME: CI script to validate models.py against live Bedrock APIs
+# ABOUTME: Script to validate models.py against live Bedrock APIs (needs AWS credentials)
 # ABOUTME: Checks ListFoundationModels (regions) and ListInferenceProfiles (CRIS routing)
 
 """Validate that CLAUDE_MODELS in models.py matches live Bedrock APIs.
@@ -29,7 +29,7 @@ try:
 except ImportError:
     HAS_BOTO3 = False
 
-# The script runs from the repo root in CI (no package install), so put
+# The script runs from the repo root (no package install), so put
 # source/ on sys.path to import the shared comparison core from the package.
 _SOURCE_DIR = Path(__file__).parent.parent / "source"
 if str(_SOURCE_DIR) not in sys.path:

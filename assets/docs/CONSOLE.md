@@ -73,11 +73,20 @@ exported file (covered by `tests/cli/commands/test_console.py`).
 ## Security notes
 
 - **Localhost only.** The server binds `127.0.0.1` exclusively — it is never reachable
-  from the network. A `Host` header check rejects DNS-rebinding attempts.
+  from the network. A `Host` header check rejects DNS-rebinding attempts: the header
+  must name `127.0.0.1` or `localhost` **and the port the console listens on**, so a
+  request forwarded to a different local port gets `403 forbidden host`.
 - **Per-session token.** A random token is generated at startup, embedded in the served
   page, and required (header `X-Gip-Token`) on every `/api/*` call. No CORS headers are
   ever emitted, so a malicious website cannot read the token or call the API from your
-  browser (drive-by localhost CSRF protection).
+  browser (drive-by localhost CSRF protection). The token is compared in constant time.
+- **No framing, no sniffing.** Every HTTP/1.x response, including error replies,
+  carries `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and a
+  Content-Security-Policy that allows only the page's own inline script and style,
+  same-origin API calls, and no framing (`frame-ancestors 'none'`), so another site
+  cannot embed the console to trick you into clicking Deploy. The one exception is a
+  malformed or HTTP/0.9-style request line, which Python's HTTP server answers
+  without any headers; browsers never send those.
 - **No secrets in answers.** Same rule as the answers file: raw client secrets are
   rejected; they belong in the OS keyring or Secrets Manager (see
   `gip init --from-file` docs).
@@ -95,6 +104,7 @@ exported file (covered by `tests/cli/commands/test_console.py`).
 | Deploy chip stuck on *running*, no events | Check the terminal running `gip console`: interactive prompts (e.g. orphaned-stack cleanup during a full deploy) appear there, not in the browser. Answer in the terminal or deploy the specific stacks instead of "all". |
 | Deploy fails immediately with *Profile … not found* | Create the profile in Step 3 first (or pass an existing profile). |
 | Validation passes but deploy fails on AWS errors | Same failure you would get from `gip deploy` — see [TROUBLESHOOTING.md](TROUBLESHOOTING.md); retry a single stack with `gip deploy <stack>`. |
+| The page (`GET /`) and API calls fail with *403 forbidden host* | The `Host` header names a different port than the console's (for example `ssh -L 9000:127.0.0.1:8321` browsed as `localhost:9000`). Forward to the same local port (`ssh -L 8321:127.0.0.1:8321 host`) or start the console with `--port` matching the forwarded port. |
 | No browser opened | Use the printed URL manually; `--no-browser` disables auto-open (e.g. over SSH, forward the port: `ssh -L 8321:127.0.0.1:8321 host`). |
 
 ## Relationship to other deployment paths

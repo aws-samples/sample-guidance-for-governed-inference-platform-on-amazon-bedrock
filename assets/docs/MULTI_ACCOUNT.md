@@ -17,12 +17,13 @@ backstops, StackSets guidance, and payer-account cost rollup.
 
 ## The anchor constraint: inference lives where the role lives
 
-Amazon Bedrock core does **not** support resource-based policies ("Supports
-resource-based policies: **No**" —
-[Bedrock IAM reference](https://docs.aws.amazon.com/bedrock/latest/userguide/security_iam_service-with-iam.html),
-read 2026-07-08). Resource-based policies exist only for specific sub-resources
-(managed knowledge bases, guardrails, AgentCore runtime/gateway) — **not for
-foundation models or inference profiles**. Users in account X therefore cannot
+Amazon Bedrock supports resource-based policies only for specific resources, and
+none of them grants model invocation. The
+[Bedrock IAM reference](https://docs.aws.amazon.com/bedrock/latest/userguide/security_iam_service-with-iam.html)
+(read 2026-09-29) lists resource-based policies for guardrails and guardrail
+inference profiles; other resource-based policies exist only for specific
+sub-resources (managed knowledge bases, AgentCore runtime/gateway), **not for
+foundation models or model inference profiles**. Users in account X therefore cannot
 invoke models "in" account Y via a resource policy; the only supported patterns
 are assuming a role in Y (exactly what this platform's auth stack does) or placing
 an application-owned proxy in Y (the
@@ -119,7 +120,7 @@ Placement rationale per stack:
 
 | Stack | Account class | Why |
 |---|---|---|
-| `bedrock-auth-*` (OIDC provider + roles) | **Each inference account** | No Bedrock resource-based policies → role account = inference account. Pure-IAM template, StackSet-friendly (see [StackSets](#stacksets-guidance)) |
+| `bedrock-auth-*` (OIDC provider + roles) | **Each inference account** | No resource-based policies on foundation models or inference profiles → role account = inference account. Pure-IAM template, StackSet-friendly (see [StackSets](#stacksets-guidance)) |
 | Bedrock invocation + model access | Same as auth | Physically bound to the role account. AWS managed entitlements support central subscription and member-account grants ([AWS ML blog, 2026-06-30](https://aws.amazon.com/blogs/machine-learning/simplify-multi-account-access-to-amazon-bedrock-models-with-managed-entitlements/)); this repository does not yet implement that Wave 4B workflow |
 | `quota-metering` | Each inference account, per allowed region | Bedrock invocation logging uses a delivery role restricted to the local source account and Region (`deployment/infrastructure/quota-metering.yaml:98-124`) |
 | `quota-monitoring` (DDB + quota API) | **Each inference account** | The quota API and `UserQuotaMetrics` table are enforcement state and remain inside the cell. HTTPS reachability does not make a central ledger acceptable |
@@ -186,18 +187,19 @@ model scope that matches its residency requirement:
    per-account `AllowedBedrockRegions` parameter (every
    `bedrock-auth-*` template exposes it and enforces it via
    `aws:RequestedRegion` conditions — e.g.
-   `deployment/infrastructure/bedrock-auth-okta.yaml:49,159`).
+   `deployment/infrastructure/bedrock-auth-okta.yaml:110,229`).
 2. **Geo-scoped inference profiles per account.** The model catalog treats
    `au`, `jp`, `eu`, and `us-gov` as data-residency prefixes that never fall back
    to `global.*`/`us.*` profiles
-   (`source/governed_inference_platform/models.py:1697` — `DATA_RESIDENCY_PREFIXES`).
+   (`source/governed_inference_platform/models.py:1818` — `DATA_RESIDENCY_PREFIXES`).
    Configure each Geo account's profile with the matching prefix so packaged
    settings resolve to residency-safe CRIS profile IDs.
-3. **SCP-1 below as the org backstop** for each Geo OU, with the region list set
-   per OU. Note the caveat: `aws:RequestedRegion` pins where the **API call**
-   lands, not where a `global.*` cross-region inference profile routes compute —
-   strict-residency Geos must combine the SCP with geo-scoped (`eu.`/`jp.`/`au.`)
-   profiles from step 2, never `global.*`.
+3. **SCP-1 below as the org backstop** for each Geo OU, with the Region list and
+   the geography prefix set per OU. SCP-1 lets only that geography's own profiles
+   route cross-Region and denies `global.*`, so residency holds even if a role
+   allows global CRIS (the break-glass role is a deliberate exception; see below). It still pins only where the **API call** originates, so
+   Geo accounts should use the geo-scoped (`eu.`/`jp.`/`au.`) profiles from step 2.
+   The global-CRIS variant is for OUs without residency requirements.
 4. **Entry control per account** via trust-policy claim conditions (see the
    identity-boundary note above): the EU account's role trusts only EU groups,
    and so on.
@@ -205,11 +207,13 @@ model scope that matches its residency requirement:
 ## SCP library
 
 Org-level backstops for controls the templates already enforce per-role
-(`bedrock-auth-generic.yaml:126-128` region condition; the `bedrock-mantle` deny).
+(`bedrock-auth-generic.yaml:217-219` region condition; the `bedrock-mantle` deny).
 Patterns follow the
 [AWS SCP examples](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_scps_examples_general.html)
-(read 2026-07-08). Limits to keep in mind: 5,120 bytes per SCP; SCPs do not affect
-service-linked roles. **Test every SCP on a sandbox OU before org-wide
+(read 2026-07-08). Limits to keep in mind: 10,240 characters per SCP document and
+at most 10 SCPs attached directly to each root, OU, or account
+([Organizations quotas](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_reference_limits.html),
+read 2026-09-29); SCPs do not affect service-linked roles. **Test every SCP on a sandbox OU before org-wide
 attachment — an SCP deny cannot be overridden by any IAM policy in member
 accounts.**
 
@@ -229,7 +233,23 @@ accounts.**
           "aws:RequestedRegion": ["us-east-1", "us-west-2"]
         },
         "ArnNotLike": {
-          "aws:PrincipalARN": "arn:aws:iam::*:role/BedrockPlatformBreakGlass"
+          "aws:PrincipalARN": "arn:aws:iam::*:role/BedrockPlatformBreakGlass",
+          "bedrock:InferenceProfileArn": "arn:aws:bedrock:*:*:inference-profile/us.*"
+        }
+      }
+    },
+    {
+      "Sid": "DenyGlobalCrossRegionInference",
+      "Effect": "Deny",
+      "Action": "bedrock:*",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "aws:RequestedRegion": "unspecified" },
+        "ArnLike": {
+          "bedrock:InferenceProfileArn": [
+            "arn:aws:bedrock:*:*:inference-profile/global.*",
+            "arn:aws:bedrock:*:*:application-inference-profile/*"
+          ]
         }
       }
     }
@@ -237,16 +257,98 @@ accounts.**
 }
 ```
 
+Set the Region list and the `us.` prefix per OU (for example `eu.` with the EU
+Regions). For every principal except the break-glass role, only the OU's own
+geography can route outside the list, and global CRIS is denied. Break-glass use
+is a residency exception: that role is exempt from the first statement, so it can
+call any Region, and only global CRIS stays denied to it.
+
 - **Rationale:** org-wide version of the `AllowedBedrockRegions` role condition —
   survives template drift and covers principals the platform did not create.
   Replace the region list with your deployment's `AllowedBedrockRegions`; keep a
   break-glass role exemption.
-- **Caveat (global CRIS):** `aws:RequestedRegion` constrains the API endpoint, not
-  where a `global.*` cross-region inference profile routes compute. For strict
-  residency, pair with geo-scoped (`us.`/`eu.`/`jp.`/`au.`) profiles.
+- **How the statements work** (all AWS sources read 2026-09-29):
+  - For a cross-Region inference (CRIS) request, Bedrock authorizes the inference
+    profile in the source Region and then the foundation model in each
+    destination Region.
+  - Only the foundation-model evaluations carry `bedrock:InferenceProfileArn`, so
+    an exemption on that key can't lift the Region check on the originating call
+    ([geographic CRIS](https://docs.aws.amazon.com/bedrock/latest/userguide/geographic-cross-region-inference.html)).
+  - The first statement exempts only the OU's own geographic profiles (`us.*`).
+    This exemption form is our adaptation of a pattern in
+    [Securing Amazon Bedrock cross-Region inference](https://aws.amazon.com/blogs/machine-learning/securing-amazon-bedrock-cross-region-inference-geographic-and-global/),
+    where AWS uses `us.*` inside a separate statement that denies non-US
+    geographic profiles (`DenyNonUSGeographicCRIS`).
+    A `us.*` profile can therefore reach `us-east-2` from `us-east-1`, while an
+    `eu.*` or `global.*` profile can't leave the list.
+  - The second statement is the global-CRIS deny from the
+    [global CRIS page](https://docs.aws.amazon.com/bedrock/latest/userguide/global-cross-region-inference.html):
+    global routing is evaluated against the Region-agnostic
+    `arn:aws:bedrock:::foundation-model/...` ARN with `aws:RequestedRegion` set
+    to `unspecified`. The second statement also applies to the break-glass role,
+    so global CRIS is the one thing that stays denied to it.
+  - The account wildcard can only match the caller's own profiles, because
+    inference profiles have no resource-based policies (see the anchor
+    constraint above).
+- **Application inference profiles:** the Bedrock CRIS pages do not say whether
+  `bedrock:InferenceProfileArn` carries the application profile ARN or the ARN of
+  the system profile it copies **[unverified]**. AWS's
+  [re:Post example](https://repost.aws/knowledge-center/bedrock-access-denied-exception)
+  uses `application-inference-profile/*` values for this key, which suggests the
+  former. Either way, an application profile can't route outside the list: the
+  first statement denies it unless the key matches `us.*`, and the second
+  statement matches both ARN forms. The trade-off is that an application profile
+  that copies `us.*` may be denied for destinations outside the list. Add its ARN
+  to the exemption, or add the destination Regions to the list.
+- **GIP's own application inference profiles:** GIP can use optional application
+  profiles for team and cost-center attribution
+  ([COST_ATTRIBUTION.md section 5](COST_ATTRIBUTION.md#5-optional-application-inference-profiles-for-teamcost-center-attribution),
+  [ADR-0021](adr/0021-application-inference-profiles-additive.md)), and `gip package`
+  writes their ARNs into the distributed Claude Code settings. Before you enable them
+  in an OU that has the default SCP-1, add each application profile ARN to the first
+  statement's `bedrock:InferenceProfileArn` exemption. Otherwise requests that
+  Bedrock routes to a destination outside the Region list get `AccessDenied`. Routing
+  varies per request, so the failures look intermittent.
+- **Caveat (residency):** the Region list constrains where calls originate. A
+  `us.*` profile can still route to any destination Region in its geography,
+  including Regions outside the list. For single-Region processing, invoke the
+  foundation model directly and remove the exemption.
 - **Blast radius:** denies ALL Bedrock use outside the listed regions for every
   principal in the attached OU — including consoles, notebooks, and other teams'
   workloads. Attach to the platform/Geo OU, not the root, until validated.
+
+**SCP-1 variant for OUs without residency requirements (opt-in to global CRIS).**
+Drop the `DenyGlobalCrossRegionInference` statement and widen the first statement's
+exemption to every system-defined and application profile. The complete variant:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyBedrockOutsideAllowedRegions",
+      "Effect": "Deny",
+      "Action": ["bedrock:*", "bedrock-mantle:*"],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:RequestedRegion": ["us-east-1", "us-west-2"]
+        },
+        "ArnNotLike": {
+          "aws:PrincipalARN": "arn:aws:iam::*:role/BedrockPlatformBreakGlass",
+          "bedrock:InferenceProfileArn": [
+            "arn:aws:bedrock:*:*:inference-profile/*",
+            "arn:aws:bedrock:*:*:application-inference-profile/*"
+          ]
+        }
+      }
+    }
+  ]
+}
+```
+
+This matches the auth role, whose `AllowBedrockInvokeGlobal` statement allows the
+Region-agnostic foundation-model ARN. Do not attach the variant to a residency OU.
 
 ### SCP-2 — Deny `bedrock-mantle:*` org-wide (unmeterable endpoint)
 

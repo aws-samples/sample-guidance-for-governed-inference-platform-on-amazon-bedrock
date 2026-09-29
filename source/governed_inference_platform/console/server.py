@@ -18,6 +18,7 @@ Design constraints (see assets/docs/CONSOLE.md):
 """
 
 import contextlib
+import hmac
 import json
 import re
 import secrets
@@ -46,6 +47,19 @@ from governed_inference_platform.models import CLAUDE_MODELS, DEFAULT_REGIONS
 MAX_BODY_BYTES = 1_000_000
 TOKEN_HEADER = "X-Gip-Token"  # nosec B105 — HTTP header name, not a credential
 _ALLOWED_HOSTS = ("127.0.0.1", "localhost")
+# The SPA is one self-contained page with inline <script>/<style> and inline
+# event handlers, so inline sources are allowed; everything else (framing,
+# external loads, form posts, <base> rewrites) is refused.
+CONTENT_SECURITY_POLICY = (
+    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+    "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+)
+SECURITY_HEADERS = (
+    ("X-Content-Type-Options", "nosniff"),
+    ("Referrer-Policy", "no-referrer"),
+    ("X-Frame-Options", "DENY"),
+    ("Content-Security-Policy", CONTENT_SECURITY_POLICY),
+)
 
 # Wizard step-2 module catalog (UI metadata only — descriptions and dependency
 # notes for the card grid; the enable/disable flags map 1:1 onto answers-file
@@ -364,12 +378,19 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):  # noqa: A002 - stdlib signature
         pass  # keep the gip console terminal quiet
 
+    def end_headers(self) -> None:
+        # Every response with a status line gets these, including stdlib send_error() replies
+        # (e.g. 501 for HEAD). Stdlib exception: malformed or HTTP/0.9-style request lines are
+        # answered with no status line or headers at all.
+        # Anti-clickjacking matters because the console can start deploys.
+        for name, value in SECURITY_HEADERS:
+            self.send_header(name, value)
+        super().end_headers()
+
     def _send(self, status: int, body: bytes, content_type: str, extra_headers: dict | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
         # One request per connection: responses (e.g. 401) may be sent before
         # the request body was read, which would poison a kept-alive socket.
         self.send_header("Connection", "close")
@@ -383,15 +404,19 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
         self._send(status, json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8")
 
     def _reject_bad_host(self) -> bool:
-        """DNS-rebinding guard: only accept Host headers naming this machine."""
-        host = (self.headers.get("Host") or "").split(":")[0].lower()
-        if host not in _ALLOWED_HOSTS:
+        """DNS-rebinding guard: only accept Host headers naming this machine and this port."""
+        port = self.server.server_address[1]
+        allowed = {f"{h}:{port}" for h in _ALLOWED_HOSTS}
+        if port == 80:  # browsers omit the default port
+            allowed.update(_ALLOWED_HOSTS)
+        if (self.headers.get("Host") or "").lower() not in allowed:
             self._send_json(403, {"error": "forbidden host"})
             return True
         return False
 
     def _check_token(self) -> bool:
-        if self.headers.get(TOKEN_HEADER) == self.server.token:
+        provided = (self.headers.get(TOKEN_HEADER) or "").encode("utf-8")
+        if hmac.compare_digest(provided, self.server.token.encode("utf-8")):
             return True
         self._send_json(401, {"error": f"missing or invalid {TOKEN_HEADER} header"})
         return False

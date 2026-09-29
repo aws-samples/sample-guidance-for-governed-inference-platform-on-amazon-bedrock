@@ -1,12 +1,12 @@
 # ABOUTME: Pure comparison core for model-catalog drift detection against live Bedrock APIs
-# ABOUTME: Shared by `gip models check` and scripts/validate_bedrock_regions.py (CI)
+# ABOUTME: Shared by `gip models check` and scripts/validate_bedrock_regions.py (live-API script)
 
 """Compare the hardcoded model catalog (models.py) against live Bedrock API data.
 
 All functions here are pure: they take pre-fetched API responses (or data
 extracted from CLAUDE_MODELS) and return structured diff results. No AWS
 calls are made from this module, which keeps it trivially testable with
-fixture responses and reusable from both the CLI command and the CI script.
+fixture responses and reusable from both the CLI command and the validation script.
 
 See REVIEW.md finding #13: the catalog is curated by hand, so drift against
 the live Bedrock APIs is expected over time. This module makes that drift

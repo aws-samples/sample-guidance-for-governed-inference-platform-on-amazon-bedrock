@@ -2,8 +2,9 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
   Amazon Bedrock AgentCore Gateway with the managed Web Search connector for
   Claude Cowork. Supports both OIDC (CUSTOM_JWT) and IAM Identity Center (IAM)
-  authorization modes via the AuthType parameter. Deploy into us-east-1 (the
-  only region where the Web Search connector is currently available).
+  authorization modes via the AuthType parameter. Deploy into us-east-1, the
+  only Region this repository validates for web search (AWS also lists the
+  connector in eu-west-1 and ap-northeast-1).
   DATA RESIDENCY: web search queries are processed in us-east-1 regardless of
   where Bedrock inference or the IDE session runs. Organizations with data
   residency or sovereignty obligations should evaluate whether user query data

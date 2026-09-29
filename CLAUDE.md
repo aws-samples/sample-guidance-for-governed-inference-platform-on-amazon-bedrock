@@ -31,7 +31,7 @@ AWS guidance for a Governed Inference Platform on Amazon Bedrock. Python CLI (`g
 
 ## Branch Strategy
 
-- Target: `beta` (not `main`). Rebase before PRs. `main` is release-only.
+- Target: `main`. Rebase onto the latest `main` before opening a pull request (see `.claude/rules/branch-strategy.md`).
 
 ## Architecture
 
