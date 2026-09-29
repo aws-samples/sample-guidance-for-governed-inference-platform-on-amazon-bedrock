@@ -147,8 +147,9 @@ jobs:
           (out / "credential-process-windows.exe").write_bytes(b"gip-e2e-stub-credential-process")
           (out / "otel-helper.cmd").write_text("@echo off\r\n", encoding="utf-8")
           (out / "otel-helper.ps1").write_text("# gip e2e stub otel helper\n", encoding="utf-8")
+          # Same shape as PackageCommand._create_config: profiles under "profiles".
           (out / "config.json").write_text(
-              json.dumps({"gip-e2e": {"aws_region": "us-east-1"}}), encoding="utf-8"
+              json.dumps({"profiles": {"gip-e2e": {"aws_region": "us-east-1"}}}), encoding="utf-8"
           )
           profile = Profile(
               name="gip-e2e",
@@ -383,11 +384,12 @@ jobs:
           # AWS profile written with the credential_process pointing into the
           # user home (forward slashes, as generated).
           $awsConfigPath = Join-Path $homeDir '.aws\config'
-          $awsConfig = Get-Content -LiteralPath $awsConfigPath -Raw
-          if ($awsConfig -notmatch '\[profile gip-e2e\]') { throw 'AWS profile section missing' }
+          if (-not (Test-Path -LiteralPath $awsConfigPath -PathType Leaf)) { throw 'AWS config was not written' }
+          $awsConfig = [IO.File]::ReadAllText($awsConfigPath)
           $expectedCredential = ($homeDir + '\gip\credential-process.exe --profile gip-e2e') -replace '\\', '/'
-          if (-not $awsConfig.Contains("credential_process = $expectedCredential")) {
-              throw 'credential_process entry missing or pointing outside the user home'
+          if (-not $awsConfig.Contains('[profile gip-e2e]') -or -not $awsConfig.Contains("credential_process = $expectedCredential")) {
+              Write-Host "---- $awsConfigPath ----"; Write-Host $awsConfig; Write-Host '----'
+              throw 'AWS profile section or its credential_process entry is missing or points outside the user home'
           }
 
           # No writes requiring elevation, no leakage into the admin profile
@@ -450,7 +452,7 @@ jobs:
           if ($result.ExitCode -eq 0) { throw 'expected install.bat to refuse the tampered owned file' }
           if (($result.StdOut + $result.StdErr) -notmatch 'owned-modified') { throw 'owned-modified refusal missing' }
           if (($result.StdOut + $result.StdErr) -notmatch 'No installation files were changed') { throw 'preflight no-change message missing' }
-          if ((Get-Content -LiteralPath $configPath -Raw) -notmatch 'tampered by e2e') { throw 'tampered content was not preserved' }
+          if (-not [IO.File]::ReadAllText($configPath).Contains('tampered by e2e')) { throw 'tampered content was not preserved' }
           if ((Get-GipSha256 (Join-Path $homeDir 'gip\credential-process.exe')) -ne $credentialSha) { throw 'sibling owned file changed during refusal' }
           Assert-GipNoTransactionLeftovers $homeDir
 
