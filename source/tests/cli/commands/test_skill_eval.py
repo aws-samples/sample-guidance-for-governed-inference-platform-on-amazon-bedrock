@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import yaml
 from cleo.testers.command_tester import CommandTester
 
@@ -220,6 +221,26 @@ class TestManifestValidation:
         case = {"id": "c", "expect": {"forbidden_paths": ["../*.tfstate"]}}
         errors = validate_eval_manifest(_manifest(cases=[case]))
         assert any("forbidden_paths" in e and "no '..'" in e for e in errors)
+
+    @pytest.mark.parametrize("escape", ["C:\\schemas\\s.json", "C:s.json", "\\schemas\\s.json", "a\\..\\..\\s.json"])
+    def test_windows_style_escapes_rejected_on_every_platform(self, escape):
+        """A manifest written on one OS must not escape its base directory on another.
+
+        On Windows, ``skill_dir / "\\x"`` lands on the drive root and ``C:x`` on another
+        drive, so these are rejected everywhere, not only where pathlib treats them as absolute.
+        """
+        case = {
+            "id": "c",
+            "fixtures": escape,
+            "expect": {"files": [{"path": escape, "json_schema": escape}], "forbidden_paths": [escape]},
+        }
+        errors = validate_eval_manifest(_manifest(cases=[case]))
+        for field in ("fixtures", ".path", "json_schema", "forbidden_paths"):
+            assert any(field in e and "no '..'" in e for e in errors), (field, errors)
+
+    def test_nested_relative_paths_still_accepted(self):
+        case = {"id": "c", "expect": {"files": [{"path": "out/findings.json"}], "forbidden_paths": ["**/*.pem"]}}
+        assert validate_eval_manifest(_manifest(cases=[case])) == []
 
     def test_must_exist_false_with_contains_rejected(self):
         case = {"id": "c", "expect": {"files": [{"path": "a.md", "must_exist": False, "contains": ["x"]}]}}

@@ -5362,6 +5362,10 @@ echo OK Web search headersHelper installed
         installer_content = f"""@echo off
 SETLOCAL ENABLEDELAYEDEXPANSION
 cd /d "%~dp0"
+REM Windows PowerShell must not inherit a PowerShell 7 PSModulePath (for example when
+REM this file is started from a pwsh terminal): it would load PowerShell 7 modules and
+REM fail on Get-FileHash. Clearing it restores the Windows PowerShell defaults.
+set "PSModulePath="
 REM Claude Code Authentication Installer for Windows
 REM Organization: {profile.provider_domain}
 REM Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}

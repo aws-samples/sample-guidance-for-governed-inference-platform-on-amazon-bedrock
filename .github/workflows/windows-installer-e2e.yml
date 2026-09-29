@@ -65,15 +65,24 @@
 #     of already-quarantined owned files, which is the reachable mid-install
 #     failure through the real install.bat entry point.
 #
-# COST CONTROL: workflow_dispatch only; never runs on pushes or pull requests.
-# The pull_request trigger is disabled until the generated installer isolates
-# PSModulePath when Windows PowerShell is started through cmd.exe from
-# PowerShell 7 (Get-FileHash fails with CommandNotFoundException otherwise).
+# The run starts install.bat from PowerShell 7 (pwsh -> cmd.exe -> powershell.exe),
+# so it also guards the PSModulePath isolation in install.bat and otel-helper.cmd.
+#
+# COST CONTROL: workflow_dispatch plus PRs that touch the installer generator,
+# its guarded tests, the packaged otel-helper.cmd, or this workflow. Never runs
+# on plain pushes.
 
 name: Windows Installer E2E (standard user)
 
 on:
   workflow_dispatch: {}
+  pull_request:
+    branches: ["main", "beta"]
+    paths:
+      - 'source/governed_inference_platform/cli/commands/package.py'
+      - 'source/tests/cli/commands/test_windows_installer_transaction.py'
+      - 'source/otel_helper/otel-helper.cmd'
+      - '.github/workflows/windows-installer-e2e.yml'
 
 permissions:
   contents: read

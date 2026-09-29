@@ -32,6 +32,11 @@ from governed_inference_platform.cli.commands.cleanup import CleanupCommand
 from governed_inference_platform.cli.commands.package import PackageCommand
 from governed_inference_platform.config import Profile
 
+# install.sh is the macOS/Linux installer; install.bat has its own Windows tests
+# (test_windows_installer_transaction.py and windows-installer-e2e.yml). On Windows,
+# `bash` resolves to WSL, which hosted runners do not provision.
+posix_install_sh = pytest.mark.skipif(sys.platform == "win32", reason="runs the POSIX install.sh")
+
 
 def _host_binary_suffix():
     """Return the BINARY_SUFFIX that the generated install.sh selects on this host.
@@ -313,6 +318,7 @@ class TestIDCZeroBinaryManifest:
         assert "GIP_SETTINGS_CREATED" in installer
         assert "Preserving existing Claude Code settings" in installer
 
+    @posix_install_sh
     def test_installer_and_cleanup_round_trip_owned_state(self, tmp_path, monkeypatch):
         package_dir = tmp_path / "package"
         package_dir.mkdir()
@@ -362,6 +368,7 @@ class TestIDCZeroBinaryManifest:
         aws_config = (home / ".aws" / "config").read_text(encoding="utf-8")
         assert "gip" not in aws_config
 
+    @posix_install_sh
     def test_existing_settings_are_preserved_and_not_claimed(self, tmp_path):
         package_dir = tmp_path / "package"
         package_dir.mkdir()
@@ -394,6 +401,7 @@ class TestIDCZeroBinaryManifest:
         manifest = json.loads((home / "gip" / ".gip-ownership.json").read_text(encoding="utf-8"))
         assert ".claude/settings.json" not in manifest["files"]
 
+    @posix_install_sh
     def test_existing_aws_profile_fails_before_side_effects(self, tmp_path):
         package_dir = tmp_path / "package"
         package_dir.mkdir()
@@ -425,6 +433,7 @@ class TestIDCZeroBinaryManifest:
         assert "foreign AWS profile" in result.stdout
         assert not (home / "gip").exists()
 
+    @posix_install_sh
     def test_reinstall_accepts_owned_unchanged_and_rejects_owned_modified(self, tmp_path):
         package_dir = tmp_path / "package"
         package_dir.mkdir()
@@ -480,6 +489,7 @@ def test_single_external_installer_also_fails_closed(tmp_path):
         PackageCommand()._create_installer(tmp_path, _make_oidc_central_profile(), [], [])
 
 
+@posix_install_sh
 def test_standard_installer_rejects_foreign_managed_file_before_writes(tmp_path):
     package_dir = tmp_path / "package"
     package_dir.mkdir()
@@ -506,6 +516,7 @@ def test_standard_installer_rejects_foreign_managed_file_before_writes(tmp_path)
     assert not (home / ".aws" / "config").exists()
 
 
+@posix_install_sh
 def test_standard_installer_reinstall_accepts_owned_unchanged_state(tmp_path):
     package_dir = tmp_path / "package"
     package_dir.mkdir()
@@ -531,6 +542,7 @@ def test_standard_installer_reinstall_accepts_owned_unchanged_state(tmp_path):
     assert second.returncode == 0, second.stderr or second.stdout
 
 
+@posix_install_sh
 def test_standard_installer_reinstalls_all_resolved_managed_files_and_rejects_tampering(tmp_path):
     package_dir = tmp_path / "package"
     package_dir.mkdir()
@@ -602,6 +614,7 @@ def test_standard_installer_reinstalls_all_resolved_managed_files_and_rejects_ta
     assert tampered.read_text(encoding="utf-8") == '{"tampered": true}\n'
 
 
+@posix_install_sh
 def test_standard_installer_rejects_foreign_resolved_managed_file_before_writes(tmp_path):
     package_dir = tmp_path / "package"
     package_dir.mkdir()
@@ -631,6 +644,7 @@ def test_standard_installer_rejects_foreign_resolved_managed_file_before_writes(
     assert not (home / "gip" / "credential-process").exists()
 
 
+@posix_install_sh
 def test_standard_installer_preserves_foreign_settings_and_does_not_claim_them(tmp_path):
     package_dir = tmp_path / "package"
     package_dir.mkdir()
@@ -656,6 +670,7 @@ def test_standard_installer_preserves_foreign_settings_and_does_not_claim_them(t
     assert ".claude/settings.json" not in manifest["files"]
 
 
+@posix_install_sh
 def test_standard_installer_rejects_sudo_before_writes(tmp_path):
     package_dir = tmp_path / "package"
     package_dir.mkdir()
@@ -701,6 +716,31 @@ def test_windows_preflight_runs_before_first_install_write(tmp_path):
     assert "-InstallManaged" in installer
 
 
+def test_windows_installer_clears_psmodulepath_before_any_powershell(tmp_path):
+    """install.bat started from PowerShell 7 must not leak its PSModulePath into Windows PowerShell.
+
+    The inherited value lists PowerShell 7 modules first, so Windows PowerShell failed on
+    Get-FileHash and the install rolled back (PowerShell/PowerShell#27774).
+    """
+    installer = (
+        PackageCommand()._create_windows_installer(tmp_path, _make_oidc_central_profile()).read_text(encoding="utf-8")
+    )
+    lines = [line.strip() for line in installer.splitlines()]
+    clear = lines.index('set "PSModulePath="')
+    first_powershell = next(
+        i for i, line in enumerate(lines) if "powershell" in line.lower() and not line.startswith("REM")
+    )
+    assert lines.index("SETLOCAL ENABLEDELAYEDEXPANSION") < clear < first_powershell
+
+
+def test_otel_helper_cmd_clears_psmodulepath_before_powershell_fallback():
+    helper = (Path(__file__).parents[3] / "otel_helper" / "otel-helper.cmd").read_text(encoding="utf-8")
+    lines = [line.strip() for line in helper.splitlines()]
+    fallback = next(i for i, line in enumerate(lines) if line.lower().startswith("powershell"))
+    assert lines.index("setlocal") < lines.index('set "PSModulePath="') < fallback
+
+
+@posix_install_sh
 def test_idc_installer_rejects_standard_mode_manifest_before_writes(tmp_path):
     standard_package = tmp_path / "standard"
     standard_package.mkdir()
@@ -749,6 +789,7 @@ def test_idc_installer_rejects_standard_mode_manifest_before_writes(tmp_path):
     assert (home / "gip" / "credential-process").read_text(encoding="utf-8") == "binary"
 
 
+@posix_install_sh
 def test_idc_reinstall_accepts_crlf_aws_config_without_duplicate_sections(tmp_path):
     package_dir = tmp_path / "package"
     package_dir.mkdir()

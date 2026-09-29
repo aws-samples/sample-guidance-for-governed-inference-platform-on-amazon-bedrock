@@ -7,12 +7,10 @@ on:
       - 'source/**'
       - 'deployment/infrastructure/**'
       - '.github/workflows/pytest-ci.yml'
+  # No paths filter on pull requests: these jobs are required status checks, and a
+  # filtered-out required check never reports, which would block the pull request.
   pull_request:
     branches: ["main", "beta"]
-    paths:
-      - 'source/**'
-      - 'deployment/infrastructure/**'
-      - '.github/workflows/pytest-ci.yml'
   workflow_dispatch: {}
 
 permissions:
@@ -34,12 +32,11 @@ jobs:
         python-version: ['3.10', '3.11', '3.12', '3.13']
         os: [ubuntu-latest]
         include:
-          # Spot-check on macOS with latest Python only. windows-latest is
-          # excluded until the Windows-specific test failures (os.uname, WSL
-          # bash and PowerShell module-path isolation) are fixed; the Windows
-          # installer has its own manual workflow, windows-installer-e2e.yml.
+          # Spot-check on macOS and Windows with latest Python only
           - python-version: '3.12'
             os: macos-latest
+          - python-version: '3.12'
+            os: windows-latest
 
     steps:
       - uses: actions/checkout@v7

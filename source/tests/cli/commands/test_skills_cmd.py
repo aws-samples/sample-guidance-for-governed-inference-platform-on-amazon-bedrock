@@ -172,7 +172,9 @@ def _run(command, args, profile, capsys=None):
     output = tester.io.fetch_output() + tester.io.fetch_error()
     if capsys is not None:
         output += capsys.readouterr().out
-    return code, output
+    # rich wraps to the console width, which differs by OS (Windows breaks mid-message),
+    # so assertions match on whitespace-normalized text.
+    return code, " ".join(output.split())
 
 
 # ---------------------------------------------------------------------------

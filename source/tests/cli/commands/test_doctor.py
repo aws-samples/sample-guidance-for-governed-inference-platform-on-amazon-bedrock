@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from governed_inference_platform.cli import create_application
 from governed_inference_platform.cli.commands.doctor import (
     _find_binary,
+    _run_binary_json,
     run_doctor,
 )
 from governed_inference_platform.cli.commands.package import PackageCommand
@@ -105,6 +106,27 @@ class TestDoctorBinaryDetection:
         """Returns None when binary not found."""
         result = _find_binary(tmp_path, "nonexistent")
         assert result is None
+
+
+class TestDoctorWindowsPowerShellEnvironment:
+    """Windows PowerShell must not inherit a PowerShell 7 PSModulePath."""
+
+    def test_ps1_fallback_runs_without_inherited_psmodulepath(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PSModulePath", r"C:\Program Files\PowerShell\7\Modules")
+        script = tmp_path / "otel-helper.ps1"
+        completed = MagicMock(returncode=0, stdout='{"ok": true}')
+        with patch("governed_inference_platform.cli.commands.doctor.run_checked", return_value=completed) as run:
+            assert _run_binary_json(script, ["--explain"]) == {"ok": True}
+        argv, kwargs = run.call_args.args[0], run.call_args.kwargs
+        assert argv[:4] == ["powershell", "-ExecutionPolicy", "Bypass", "-File"]
+        assert not any(key.upper() == "PSMODULEPATH" for key in kwargs["env"])
+        assert kwargs["env"]  # the rest of the environment is kept
+
+    def test_exe_keeps_the_inherited_environment(self, tmp_path):
+        completed = MagicMock(returncode=0, stdout="{}")
+        with patch("governed_inference_platform.cli.commands.doctor.run_checked", return_value=completed) as run:
+            _run_binary_json(tmp_path / "credential-process.exe", ["--explain"])
+        assert run.call_args.kwargs["env"] is None
 
 
 class TestDoctorHealthChecks:

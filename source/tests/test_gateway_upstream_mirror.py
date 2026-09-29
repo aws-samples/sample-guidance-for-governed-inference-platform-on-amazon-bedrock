@@ -24,6 +24,8 @@ VERIFICATION_FORMAT = "git-tree-sha1-v1"
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="exercises POSIX modes, symlinks, and FIFOs")
+# The fetch and sync scripts are bash; on Windows `bash` resolves to WSL, which hosted runners do not provision.
+bash_only = pytest.mark.skipif(sys.platform == "win32", reason="runs the bash fetch/sync scripts")
 
 
 def _pin() -> dict:
@@ -213,6 +215,7 @@ def test_upstream_subtrees_are_not_tracked_and_are_ignored():
     ]
 
 
+@bash_only
 def test_fetch_script_parses_and_documents_its_modes():
     assert FETCH_SCRIPT.is_file()
 
@@ -354,12 +357,14 @@ def test_offline_verify_rejects_every_git_visible_tamper(tmp_path, case):
     assert "tree id mismatch" in tampered.stderr.lower()
 
 
+@bash_only
 def test_sync_script_has_valid_shell_syntax():
     result = run_cmd(["bash", "-n", str(SYNC_SCRIPT)], capture_output=True, text=True, check=False)  # nosec B603
 
     assert result.returncode == 0, result.stderr
 
 
+@bash_only
 def test_sync_script_rejects_alternate_source_in_write_mode(tmp_path):
     result = run_cmd(  # nosec B603
         ["bash", str(SYNC_SCRIPT), "--source", str(tmp_path)],
@@ -590,6 +595,7 @@ def _run_pr_workflow_step(tmp_path: Path, *, pr_exists: bool) -> list[list[str]]
     return [line.split("\t") for line in log.read_text(encoding="utf-8").splitlines()]
 
 
+@bash_only
 @pytest.mark.parametrize("pr_exists", [False, True])
 def test_sync_workflow_refreshes_pr_title_body_and_compare_url_after_create_or_update(tmp_path, pr_exists):
     commands = _run_pr_workflow_step(tmp_path, pr_exists=pr_exists)

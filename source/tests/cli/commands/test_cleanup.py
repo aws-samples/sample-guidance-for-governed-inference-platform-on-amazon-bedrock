@@ -373,6 +373,7 @@ def test_manifest_rewrite_preserves_concurrent_change(tmp_path, monkeypatch):
     assert json.loads((install / ".gip-ownership.json").read_text(encoding="utf-8")) == {"concurrent": True}
 
 
+@pytest.mark.skipif(os.name == "nt", reason="exercises the POSIX ps/kill path; Windows leaves the collector running")
 def test_runtime_collector_pid_is_stopped_only_for_exact_install_command(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     install = tmp_path / "gip"
@@ -479,6 +480,7 @@ def test_crlf_aws_sections_match_canonical_manifest_digest(tmp_path, monkeypatch
     assert _command()._matching_profile_section(manifest, aws_config, "gip", None) == _digest(canonical)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="exercises the POSIX ps/kill path; Windows leaves the collector running")
 def test_verified_collector_that_exits_before_stop_removes_stale_pid(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     install = tmp_path / "gip"
@@ -492,3 +494,24 @@ def test_verified_collector_that_exits_before_stop_removes_stale_pid(tmp_path, m
         assert _command()._stop_owned_collector(pid_file, _digest("1234\n"), install, console)
 
     assert not pid_file.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only behaviour")
+def test_windows_leaves_collector_running_and_keeps_pid_file(tmp_path, monkeypatch):
+    """Windows cannot verify the collector's command line, so cleanup must not kill or unlink."""
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    install = tmp_path / "gip"
+    install.mkdir()
+    pid_file = install / "collector.pid"
+    pid_file.write_text("1234\n", encoding="utf-8")
+    console = type("Console", (), {"print": lambda self, *_args, **_kwargs: None})()
+
+    with (
+        patch("governed_inference_platform.cli.commands.cleanup.subprocess.run") as run,
+        patch("governed_inference_platform.cli.commands.cleanup.os.kill") as kill,
+    ):
+        assert not _command()._stop_owned_collector(pid_file, _digest("1234\n"), install, console)
+
+    run.assert_not_called()
+    kill.assert_not_called()
+    assert pid_file.exists()

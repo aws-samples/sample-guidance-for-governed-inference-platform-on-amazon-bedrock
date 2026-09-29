@@ -27,6 +27,16 @@ def _profile() -> Profile:
     )
 
 
+def _install_bat_environment() -> dict[str, str]:
+    """The environment install.bat gives Windows PowerShell: the caller's, minus PSModulePath.
+
+    These tests start powershell.exe directly, so they must clear the variable the way
+    install.bat does; otherwise a PowerShell 7 parent leaks its module path into
+    Windows PowerShell and Get-FileHash is not found.
+    """
+    return {key: value for key, value in os.environ.items() if key.upper() != "PSMODULEPATH"}
+
+
 def _run_harness(tmp_path: Path, body: str) -> subprocess.CompletedProcess[str]:
     PackageCommand()._create_windows_installer(tmp_path, _profile())
     harness = tmp_path / "transaction-test.ps1"
@@ -38,7 +48,7 @@ def _run_harness(tmp_path: Path, body: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(  # nosec B603 -- fixed argv, test-controlled input
         ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(harness)],
         cwd=tmp_path,
-        env=os.environ.copy(),
+        env=_install_bat_environment(),
         capture_output=True,
         text=True,
         check=False,
@@ -134,7 +144,7 @@ def test_install_all_commits_files_aws_config_and_manifest_together(tmp_path):
             str(home),
         ],
         cwd=tmp_path,
-        env=os.environ.copy(),
+        env=_install_bat_environment(),
         capture_output=True,
         text=True,
         check=False,
