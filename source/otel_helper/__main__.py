@@ -70,6 +70,7 @@ def _popen_checked(argv, **kwargs):
     call_args = [list(argv)]
     return subprocess.Popen(*call_args, **kwargs)  # nosec B603 — audited choke point: shell=False enforced, list argv validated above
 
+
 # Configure debug mode if requested
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "").lower() in ("true", "1", "yes", "y")
 TEST_MODE = False  # Will be set by command line argument

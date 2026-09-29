@@ -33,7 +33,8 @@ class TestCredentialOutputContract:
         """Build a credential output dict matching what the provider produces."""
         base = {
             "Version": CREDENTIAL_PROCESS_VERSION,
-            "AccessKeyId": "ASIA" + "XXXXXXXXXEXAMPLE",  # concat defeats secret-scanner literal match; fixture, not a credential
+            "AccessKeyId": "ASIA"
+            + "XXXXXXXXXEXAMPLE",  # concat defeats secret-scanner literal match; fixture, not a credential
             "SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
             "SessionToken": "FwoGZXIvYXdzEBYaDHqa0AP9H9EXAMPLE...",
             "Expiration": "2026-01-01T12:00:00Z",
