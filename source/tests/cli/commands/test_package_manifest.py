@@ -20,7 +20,9 @@ For IDC zero-binary:
 import hashlib
 import json
 import os
+import platform
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -29,6 +31,19 @@ import pytest
 from governed_inference_platform.cli.commands.cleanup import CleanupCommand
 from governed_inference_platform.cli.commands.package import PackageCommand
 from governed_inference_platform.config import Profile
+
+
+def _host_binary_suffix():
+    """Return the BINARY_SUFFIX that the generated install.sh selects on this host.
+
+    Mirrors the installer's own detection ($OSTYPE plus `uname -m`), so the stub
+    binary the tests package is the one install.sh looks for on macOS and Linux.
+    """
+    arm = platform.machine().lower() in ("arm64", "aarch64")
+    if sys.platform == "darwin":
+        return "macos-arm64" if arm else "macos-intel"
+    return "linux-arm64" if arm else "linux-x64"
+
 
 # ---------------------------------------------------------------------------
 # Fixtures: profile factories
@@ -469,7 +484,7 @@ def test_standard_installer_rejects_foreign_managed_file_before_writes(tmp_path)
     package_dir = tmp_path / "package"
     package_dir.mkdir()
     profile = _make_oidc_central_profile()
-    suffix = "macos-arm64" if os.uname().machine == "arm64" else "macos-intel"
+    suffix = _host_binary_suffix()
     binary = package_dir / f"credential-process-{suffix}"
     binary.write_text("new-binary", encoding="utf-8")
     _run_config_phase(profile, package_dir, built_executables=[(suffix, binary)])
@@ -495,7 +510,7 @@ def test_standard_installer_reinstall_accepts_owned_unchanged_state(tmp_path):
     package_dir = tmp_path / "package"
     package_dir.mkdir()
     profile = _make_oidc_central_profile()
-    suffix = "macos-arm64" if os.uname().machine == "arm64" else "macos-intel"
+    suffix = _host_binary_suffix()
     binary = package_dir / f"credential-process-{suffix}"
     binary.write_text("binary", encoding="utf-8")
     binary.chmod(0o755)
@@ -522,7 +537,7 @@ def test_standard_installer_reinstalls_all_resolved_managed_files_and_rejects_ta
     profile = _make_oidc_central_profile()
     profile.web_search_enabled = True
     profile.websearch_gateway_url = "https://gateway.example.com/mcp"
-    suffix = "macos-arm64" if os.uname().machine == "arm64" else "macos-intel"
+    suffix = _host_binary_suffix()
     binary = package_dir / f"credential-process-{suffix}"
     binary.write_text("binary", encoding="utf-8")
     binary.chmod(0o755)
@@ -591,7 +606,7 @@ def test_standard_installer_rejects_foreign_resolved_managed_file_before_writes(
     package_dir = tmp_path / "package"
     package_dir.mkdir()
     profile = _make_oidc_central_profile()
-    suffix = "macos-arm64" if os.uname().machine == "arm64" else "macos-intel"
+    suffix = _host_binary_suffix()
     binary = package_dir / f"credential-process-{suffix}"
     binary.write_text("new-binary", encoding="utf-8")
     binary.chmod(0o755)
@@ -620,7 +635,7 @@ def test_standard_installer_preserves_foreign_settings_and_does_not_claim_them(t
     package_dir = tmp_path / "package"
     package_dir.mkdir()
     profile = _make_oidc_central_profile()
-    suffix = "macos-arm64" if os.uname().machine == "arm64" else "macos-intel"
+    suffix = _host_binary_suffix()
     binary = package_dir / f"credential-process-{suffix}"
     binary.write_text("binary", encoding="utf-8")
     binary.chmod(0o755)
@@ -645,7 +660,7 @@ def test_standard_installer_rejects_sudo_before_writes(tmp_path):
     package_dir = tmp_path / "package"
     package_dir.mkdir()
     profile = _make_oidc_central_profile()
-    suffix = "macos-arm64" if os.uname().machine == "arm64" else "macos-intel"
+    suffix = _host_binary_suffix()
     binary = package_dir / f"credential-process-{suffix}"
     binary.write_text("binary", encoding="utf-8")
     _run_config_phase(profile, package_dir, built_executables=[(suffix, binary)])
@@ -689,7 +704,7 @@ def test_windows_preflight_runs_before_first_install_write(tmp_path):
 def test_idc_installer_rejects_standard_mode_manifest_before_writes(tmp_path):
     standard_package = tmp_path / "standard"
     standard_package.mkdir()
-    suffix = "macos-arm64" if os.uname().machine == "arm64" else "macos-intel"
+    suffix = _host_binary_suffix()
     binary = standard_package / f"credential-process-{suffix}"
     binary.write_text("binary", encoding="utf-8")
     binary.chmod(0o755)
