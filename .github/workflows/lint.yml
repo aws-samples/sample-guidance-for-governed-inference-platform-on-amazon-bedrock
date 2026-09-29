@@ -35,7 +35,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install ruff
-        run: pip install ruff
+        run: pip install ruff==0.16.9  # keep equal to source/poetry.lock
 
       - name: Ruff check (lint)
         working-directory: source

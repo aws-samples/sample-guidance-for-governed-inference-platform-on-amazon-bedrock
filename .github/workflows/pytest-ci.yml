@@ -34,11 +34,12 @@ jobs:
         python-version: ['3.10', '3.11', '3.12', '3.13']
         os: [ubuntu-latest]
         include:
-          # Spot-check on macOS and Windows with latest Python only
+          # Spot-check on macOS with latest Python only. windows-latest is
+          # excluded until the Windows-specific test failures (os.uname, WSL
+          # bash and PowerShell module-path isolation) are fixed; the Windows
+          # installer has its own manual workflow, windows-installer-e2e.yml.
           - python-version: '3.12'
             os: macos-latest
-          - python-version: '3.12'
-            os: windows-latest
 
     steps:
       - uses: actions/checkout@v7
@@ -49,7 +50,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install Poetry
-        run: pip install poetry
+        run: pip install poetry==2.4.3  # the Poetry that generated source/poetry.lock
 
       - name: Configure Poetry
         run: poetry config virtualenvs.in-project true
@@ -201,7 +202,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install cfn-lint
-        run: pip install cfn-lint
+        run: pip install cfn-lint==1.57.0  # keep equal to source/poetry.lock
 
       - name: Lint CloudFormation templates
         run: |

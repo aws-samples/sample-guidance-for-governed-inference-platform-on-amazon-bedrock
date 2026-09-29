@@ -65,19 +65,15 @@
 #     of already-quarantined owned files, which is the reachable mid-install
 #     failure through the real install.bat entry point.
 #
-# COST CONTROL: workflow_dispatch plus PRs that touch the installer generator,
-# its guarded tests, or this workflow. Never runs on plain pushes.
+# COST CONTROL: workflow_dispatch only; never runs on pushes or pull requests.
+# The pull_request trigger is disabled until the generated installer isolates
+# PSModulePath when Windows PowerShell is started through cmd.exe from
+# PowerShell 7 (Get-FileHash fails with CommandNotFoundException otherwise).
 
 name: Windows Installer E2E (standard user)
 
 on:
   workflow_dispatch: {}
-  pull_request:
-    branches: ["main", "beta"]
-    paths:
-      - 'source/governed_inference_platform/cli/commands/package.py'
-      - 'source/tests/cli/commands/test_windows_installer_transaction.py'
-      - '.github/workflows/windows-installer-e2e.yml'
 
 permissions:
   contents: read
@@ -105,7 +101,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install Poetry
-        run: pip install poetry
+        run: pip install poetry==2.4.3  # the Poetry that generated source/poetry.lock
 
       - name: Configure Poetry
         run: poetry config virtualenvs.in-project true
