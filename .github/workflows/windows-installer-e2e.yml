@@ -217,7 +217,10 @@ jobs:
                   [string]$HomeDir,
                   [string]$FilePath,
                   [string[]]$ArgumentList,
-                  [string]$WorkingDirectory = 'C:\gip-e2e\pkg'
+                  [string]$WorkingDirectory = 'C:\gip-e2e\pkg',
+                  # Start gip-install.ps1 the way install.bat does, without PowerShell 7's
+                  # PSModulePath; $null removes the variable (Start-Process -Environment).
+                  [switch]$AsInstallBatChild
               )
               $credential = [pscredential]::new(
                   "$env:COMPUTERNAME\$env:GIP_E2E_USER",
@@ -235,6 +238,7 @@ jobs:
                   APPDATA      = (Join-Path $HomeDir 'AppData\Roaming')
                   LOCALAPPDATA = (Join-Path $HomeDir 'AppData\Local')
               }
+              if ($AsInstallBatChild) { $environment['PSModulePath'] = $null }
               $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList `
                   -Credential $credential -WorkingDirectory $WorkingDirectory -LoadUserProfile `
                   -Environment $environment -RedirectStandardInput $stdin `
@@ -489,7 +493,7 @@ jobs:
           $duplicated = "[profile gip-e2e]`nregion = us-east-1`n[profile gip-e2e]`nregion = us-west-2`n"
           Set-Content -LiteralPath $configPath -Value $duplicated -NoNewline -Encoding utf8
           $before = Get-GipSha256 $configPath
-          $result = Invoke-GipAsStandardUser -Tag 'installall-duplicate' -HomeDir $homeDir `
+          $result = Invoke-GipAsStandardUser -Tag 'installall-duplicate' -HomeDir $homeDir -AsInstallBatChild `
               -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
               -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\gip-e2e\pkg\gip-install.ps1', '-InstallAll', '-UserHome', $homeDir)
           if ($result.ExitCode -eq 0) { throw 'expected -InstallAll to refuse duplicate AWS profile sections' }
