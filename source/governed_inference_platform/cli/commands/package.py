@@ -3897,7 +3897,7 @@ try:
             os.unlink(temporary, dir_fd=directory_fd)
             raise SystemExit(f"ERROR: Refusing to overwrite foreign target: {home / relative}")
         quarantine = f".{name}.gip-quarantine-{uuid.uuid4().hex}"
-        os.rename(name, quarantine, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.replace(name, quarantine, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
         try:
             file_fd = os.open(quarantine, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
             try:
