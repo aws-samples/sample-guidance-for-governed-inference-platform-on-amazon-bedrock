@@ -6,11 +6,10 @@ on:
     paths:
       - 'source/**'
       - '.github/workflows/lint.yml'
+  # No paths filter on pull requests: Ruff is a required status check, and a
+  # filtered-out required check never reports, which would block the pull request.
   pull_request:
     branches: ["main", "beta"]
-    paths:
-      - 'source/**'
-      - '.github/workflows/lint.yml'
   workflow_dispatch: {}
 
 permissions:

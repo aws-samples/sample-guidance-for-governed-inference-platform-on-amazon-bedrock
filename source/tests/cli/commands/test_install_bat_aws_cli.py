@@ -38,7 +38,7 @@ class TestInstallBatAwsCliHandling:
     def test_profile_setup_does_not_call_aws_configure(self):
         # Find the profile configuration section
         profile_section_start = self.content.find("REM Configure AWS profiles")
-        profile_section_end = self.content.find("Installation complete!", profile_section_start)
+        profile_section_end = self.content.find("echo Installation complete", profile_section_start)
         profile_section = self.content[profile_section_start:profile_section_end]
 
         assert "aws configure" not in profile_section
@@ -46,7 +46,7 @@ class TestInstallBatAwsCliHandling:
     def test_success_message_only_on_actual_success(self):
         """'OK Created AWS profile' must not be printed unconditionally after aws calls."""
         profile_section_start = self.content.find("REM Configure AWS profiles")
-        profile_section_end = self.content.find("Installation complete!", profile_section_start)
+        profile_section_end = self.content.find("echo Installation complete", profile_section_start)
         profile_section = self.content[profile_section_start:profile_section_end]
 
         # The old bug: 'echo OK Created' appeared outside any error check

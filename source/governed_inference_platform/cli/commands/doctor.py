@@ -75,13 +75,25 @@ def _find_binary(install_dir: Path, name: str) -> Path | None:
     return None
 
 
+def _windows_powershell_env() -> dict:
+    """Environment for starting Windows PowerShell from Python.
+
+    When ``gip`` runs from a PowerShell 7 terminal, the inherited PSModulePath lists
+    PowerShell 7 modules first, and Windows PowerShell then fails to load built-in
+    cmdlets such as Get-Content. Dropping it restores the Windows PowerShell defaults.
+    """
+    return {key: value for key, value in os.environ.items() if key.upper() != "PSMODULEPATH"}
+
+
 def _run_binary_json(binary_path: Path, args: list, timeout: int = 10) -> dict | None:
     """Run a binary with args, parse JSON stdout. Returns None on failure."""
     try:
         cmd = [str(binary_path)] + args
+        env = None
         # On Windows, .cmd/.ps1 need shell or explicit interpreter
         if binary_path.suffix == ".ps1":
             cmd = ["powershell", "-ExecutionPolicy", "Bypass", "-File"] + cmd
+            env = _windows_powershell_env()
         elif binary_path.suffix == ".cmd":
             cmd = ["cmd", "/c"] + cmd
 
@@ -90,6 +102,7 @@ def _run_binary_json(binary_path: Path, args: list, timeout: int = 10) -> dict |
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
         if result.returncode == 0 and result.stdout.strip():
             return json.loads(result.stdout)

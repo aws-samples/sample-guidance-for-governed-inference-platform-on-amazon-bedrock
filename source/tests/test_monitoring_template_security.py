@@ -133,7 +133,15 @@ def test_deploy_wires_explicit_internal_insecure_opt_in():
         }
     )
 
-    with patch.object(command, "_ensure_ecs_service_linked_role"):
+    # The template is close to CloudFormation's 51,200-byte inline limit; supply the
+    # artifacts bucket so the test does not depend on the checkout's line endings.
+    with (
+        patch.object(command, "_ensure_ecs_service_linked_role"),
+        patch(
+            "governed_inference_platform.cli.commands.deploy.get_stack_outputs",
+            return_value={"CfnArtifactsBucket": "artifacts-bucket"},
+        ),
+    ):
         result = command._deploy_stack("monitoring", profile, Console(), manager)
 
     assert result == 1

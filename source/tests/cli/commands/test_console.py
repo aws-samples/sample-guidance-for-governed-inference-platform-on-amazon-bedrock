@@ -234,9 +234,10 @@ class TestServerSecurity:
                 headers={"Content-Type": "application/json", "X-Gip-Token": server.token},
             )
             status = conn.getresponse().status
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             # Server rejected and closed the socket before the body finished
-            # uploading — the request was refused either way.
+            # uploading — the request was refused either way. Windows reports
+            # the unread-data reset as ConnectionAbortedError (WinError 10053).
             return
         finally:
             conn.close()

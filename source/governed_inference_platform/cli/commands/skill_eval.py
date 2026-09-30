@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import yaml
 from cleo.commands.command import Command
@@ -95,6 +95,17 @@ def load_eval_manifest(path: Path) -> tuple[dict | None, list[str]]:
     return manifest, []
 
 
+def _escapes_base(value: str) -> bool:
+    """Return True when a manifest path could resolve outside its base directory.
+
+    Manifests are portable, so both POSIX and Windows rules apply: absolute,
+    rooted (``/x`` or ``\\x``, which Windows joins onto the drive root) and
+    drive-qualified (``C:x``) paths are rejected, and so is any ``..`` segment.
+    """
+    posix, windows = PurePosixPath(value), PureWindowsPath(value)
+    return posix.is_absolute() or bool(windows.anchor) or ".." in posix.parts or ".." in windows.parts
+
+
 def _validate_case(i: int, case, skill_dir: Path | None) -> list[str]:
     errors: list[str] = []
     prefix = f"{EVAL_FILE}: cases[{i}]"
@@ -119,7 +130,7 @@ def _validate_case(i: int, case, skill_dir: Path | None) -> list[str]:
     if fixtures is not None:
         if not isinstance(fixtures, str):
             errors.append(f"{prefix}.fixtures must be a path string")
-        elif Path(fixtures).is_absolute() or ".." in Path(fixtures).parts:
+        elif _escapes_base(fixtures):
             errors.append(f"{prefix}.fixtures must be relative to the skill directory (no '..')")
         elif skill_dir is not None and not (skill_dir / fixtures).is_dir():
             errors.append(f"{prefix}.fixtures directory not found: {fixtures}")
@@ -161,7 +172,7 @@ def _validate_case(i: int, case, skill_dir: Path | None) -> list[str]:
         path_value = spec.get("path")
         if not path_value or not isinstance(path_value, str):
             errors.append(f"{fprefix}.path is required")
-        elif Path(path_value).is_absolute() or ".." in Path(path_value).parts:
+        elif _escapes_base(path_value):
             errors.append(f"{fprefix}.path must be relative to the workspace (no '..')")
         must_exist = spec.get("must_exist", True)
         if not isinstance(must_exist, bool):
@@ -175,7 +186,7 @@ def _validate_case(i: int, case, skill_dir: Path | None) -> list[str]:
         if schema_ref is not None:
             if not isinstance(schema_ref, str):
                 errors.append(f"{fprefix}.json_schema must be a path string")
-            elif Path(schema_ref).is_absolute() or ".." in Path(schema_ref).parts:
+            elif _escapes_base(schema_ref):
                 errors.append(f"{fprefix}.json_schema must be relative to the skill directory (no '..')")
             elif skill_dir is not None and not (skill_dir / schema_ref).is_file():
                 errors.append(f"{fprefix}.json_schema file not found: {schema_ref}")
@@ -188,7 +199,7 @@ def _validate_case(i: int, case, skill_dir: Path | None) -> list[str]:
         forbidden = []
     else:
         for j, pattern in enumerate(forbidden):
-            if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
+            if _escapes_base(pattern):
                 errors.append(f"{prefix}.expect.forbidden_paths[{j}] must be relative to the workspace (no '..')")
 
     has_assertions = exit_code is not None or bool(files) or bool(forbidden)

@@ -3897,7 +3897,7 @@ try:
             os.unlink(temporary, dir_fd=directory_fd)
             raise SystemExit(f"ERROR: Refusing to overwrite foreign target: {home / relative}")
         quarantine = f".{name}.gip-quarantine-{uuid.uuid4().hex}"
-        os.rename(name, quarantine, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.replace(name, quarantine, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
         try:
             file_fd = os.open(quarantine, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
             try:
@@ -5362,6 +5362,10 @@ echo OK Web search headersHelper installed
         installer_content = f"""@echo off
 SETLOCAL ENABLEDELAYEDEXPANSION
 cd /d "%~dp0"
+REM Windows PowerShell must not inherit a PowerShell 7 PSModulePath (for example when
+REM this file is started from a pwsh terminal): it would load PowerShell 7 modules and
+REM fail on Get-FileHash. Clearing it restores the Windows PowerShell defaults.
+set "PSModulePath="
 REM Claude Code Authentication Installer for Windows
 REM Organization: {profile.provider_domain}
 REM Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
@@ -5670,7 +5674,8 @@ echo   OK Ownership manifest recorded
 
 echo.
 echo ======================================
-echo Installation complete!
+REM ^^! prints a literal ! because this script runs with delayed expansion enabled.
+echo Installation complete^^!
 echo ======================================
 echo.
 echo Available profiles:
@@ -5701,7 +5706,8 @@ exit /b 0
             installer_content += f"""
 echo.
 echo ======================================
-echo Installation complete!
+REM ^^! prints a literal ! because this script runs with delayed expansion enabled.
+echo Installation complete^^!
 echo ======================================
 echo.
 echo Available profiles:

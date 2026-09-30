@@ -8,6 +8,11 @@
 install.sh       text eol=lf
 ccwb-install.ps1 text eol=crlf
 
+# CloudFormation accepts templates up to 51,200 bytes inline. A CRLF checkout pushes
+# otel-collector.yaml (51,181 bytes with LF) past that limit on Windows only, so the
+# deploy would need the S3 artifacts bucket there and nowhere else. Keep templates LF.
+deployment/infrastructure/*.yaml text eol=lf
+
 # Binaries — never touch line endings.
 *.exe   binary
 *.syso  binary
